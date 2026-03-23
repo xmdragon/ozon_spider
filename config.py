@@ -25,3 +25,10 @@ SLIDER_TIMEOUT = 20
 SUCCESS_THRESHOLD = 3
 
 OUTPUT_FILE = "results.json"
+
+# Seller login config
+SELLER_EMAIL = "50713906@qq.com"
+SELLER_EMAIL_APP_PASSWORD = "jjmodpmhaegobiab"
+SELLER_CLIENT_ID = "3465475"
+SELLER_STORAGE_STATE = "seller_state.json"
+SELLER_LOGIN_URL = "https://seller.ozon.ru/"
