@@ -241,33 +241,16 @@ class SellerSession:
             if not code:
                 log.error("未收到验证码")
                 return False
-            log.info("收到验证码: %s", code)
+            log.info("收到验证码")
 
-            # 诊断：输出验证码页面所有 input
+            # 填入验证码（重新查询避免旧句柄过期）
             await asyncio.sleep(2)
-            all_inputs = await self._page.query_selector_all('input')
-            for inp in all_inputs:
-                t = await inp.get_attribute('type') or ''
-                ml = await inp.get_attribute('maxlength') or ''
-                im = await inp.get_attribute('inputmode') or ''
-                ac = await inp.get_attribute('autocomplete') or ''
-                nm = await inp.get_attribute('name') or ''
-                ph = await inp.get_attribute('placeholder') or ''
-                log.info("  input type=%s maxlength=%s inputmode=%s autocomplete=%s name=%s ph=%s", t, ml, im, ac, nm, ph)
-
-            # 重新查询验证码输入框（旧句柄可能已过期）
-            await asyncio.sleep(1)
-            code_input = await self._page.query_selector('input[type="text"]')
-            if not code_input:
-                log.error("未找到验证码输入框")
-                return False
             await self._page.evaluate(
                 '([sel, val]) => { const el = document.querySelector(sel); '
                 'if(el){ el.value=val; el.dispatchEvent(new Event("input",{bubbles:true})); el.dispatchEvent(new Event("change",{bubbles:true})); } }',
                 ['input[type="text"]', code]
             )
-            log.info("验证码已填入（JS）")
-            log.info("验证码填入: %s", code)
+            log.info("验证码已填入")
 
             # 等待页面导航完成
             try:
@@ -276,23 +259,6 @@ class SellerSession:
                 pass
             await asyncio.sleep(2)
             log.info("验证码后 URL: %s", self._page.url)
-            # 诊断：输出页面上的可见文字元素
-            visible = await self._page.evaluate("""
-                () => {
-                    const res = [];
-                    document.querySelectorAll('button,a,span,div').forEach(el => {
-                        const t = el.textContent.trim();
-                        if (t && t.length > 1 && t.length < 40) {
-                            const r = el.getBoundingClientRect();
-                            if (r.width > 0 && r.height > 0)
-                                res.push(el.tagName + ':' + t);
-                        }
-                    });
-                    return [...new Set(res)].slice(0, 20);
-                }
-            """)
-            log.info("OTP/signin 页可见元素: %s", visible)
-            await self._page.screenshot(path="/tmp/seller_after_code.png")
 
             # 检测并点击「下一步」
             for _ in range(10):

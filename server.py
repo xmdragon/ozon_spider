@@ -26,7 +26,7 @@ from config import (
     SELLER_EMAIL, SELLER_EMAIL_APP_PASSWORD, SELLER_CLIENT_ID, SELLER_STORAGE_STATE,
 )
 from chrome_launcher import start_chrome, kill, start_xvfb
-from spider import fetch_product
+from spider import fetch_product, setup_page, load_cookies
 from seller_login import SellerSession, SELLER_CDP_PORT
 from playwright.async_api import async_playwright
 
@@ -80,7 +80,8 @@ async def lifespan(app: FastAPI):
             if state.spider_browser.contexts
             else await state.spider_browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow")
         )
-        state.spider_page = await state.spider_context.new_page()
+        await load_cookies(state.spider_context)
+        state.spider_page = await setup_page(state.spider_context)
         log.info("Spider browser ready")
     except Exception as e:
         log.error("Spider browser init failed: %s", e)
@@ -110,6 +111,9 @@ async def lifespan(app: FastAPI):
         await state.seller_session.close()
     if state.spider_page:
         try: await state.spider_page.close()
+        except Exception: pass
+    if state.spider_context:
+        try: await state.spider_context.close()
         except Exception: pass
     if state.spider_playwright:
         await state.spider_playwright.stop()
