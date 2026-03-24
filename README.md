@@ -1,68 +1,129 @@
-# Ozon Spider
+# Ozon Spider API
 
-抓取 [ozon.ru](https://www.ozon.ru/) 商品详情数据，绕过反爬检测，输出结构化 JSON。
+抓取 [ozon.ru](https://www.ozon.ru/) 商品详情，并通过 seller 会话补充尺寸重量，统一对外提供 HTTP API。
 
-## 功能
+## 当前架构
 
-- 通过 CDP 接管系统 Chrome（headful 模式，Xvfb 虚拟显示）
-- 并行请求 Page1 + Page2 API，提取完整商品数据
-- 自动处理滑块验证码
-- 自修复循环：连续成功 3 次后退出
-- 增量保存 cookies，提升会话稳定性
+- 匿名 spider：
+  使用系统 Chrome + Xvfb 抓取商品页和 Page1/Page2 API
+- seller session：
+  使用独立 Chrome profile 维持 Ozon Seller 登录态
+- 统一服务：
+  由 [server.py](/home/grom/ozon_spider/server.py) 启动 FastAPI，对外提供接口
 
-## 输出字段
+## API
 
-每个商品包含：
+### `GET /health`
 
-| 字段 | 说明 |
-|------|------|
-| `sku` | 商品 SKU |
-| `name` | 商品名称 |
-| `price` | 当前价格 |
-| `cardPrice` | 卡片价格（Ozon 卡专属） |
-| `realPrice` | 实际到手价（按扩展公式计算） |
-| `original_price` | 划线原价 |
-| `images` | 图片列表 |
-| `attributes` | 商品属性列表 |
-| `typeNameRu` | 商品类型（俄文） |
-| `description` | 商品描述 |
+返回服务状态，包括：
+- spider worker pool 状态
+- seller active/standby 状态
 
-## 依赖
+### `GET /sku?sku=<SKU>`
+
+返回单个 SKU 的完整商品数据：
+- 基础信息
+- 图片
+- 属性
+- seller 尺寸重量
+
+示例：
 
 ```bash
-pip install playwright requests numpy pillow scipy
+curl "http://127.0.0.1:8765/sku?sku=3714928277"
+```
+
+### `POST /variant-model`
+
+批量查询 seller 尺寸重量。
+
+请求：
+
+```json
+{"skus":["2036172405","3714928277"]}
+```
+
+### `POST /data-v3`
+
+批量查询 seller `data/v3` 数据。
+
+请求：
+
+```json
+{"skus":["2036172405","3714928277"]}
+```
+
+## 运行
+
+### 依赖
+
+```bash
+pip install playwright requests numpy pillow scipy fastapi uvicorn
 playwright install chromium
 sudo apt install google-chrome-stable xvfb
 ```
 
-## 配置
-
-编辑 `config.py`：
-
-- `SKUS`：要抓取的 SKU 列表
-- `CHROME_BIN`：Chrome 可执行文件路径（默认 `/usr/bin/google-chrome-stable`）
-- `CDP_PORT`：CDP 调试端口（默认 `9223`）
-- `SUCCESS_THRESHOLD`：连续成功次数阈值（默认 `3`）
-
-## 运行
+### 本地启动
 
 ```bash
-python3 run.py
-# 或
-bash start.sh
+python3 -m uvicorn server:app --host 127.0.0.1 --port 8765
 ```
 
-结果保存至 `results.json`。
+服务启动后访问：
 
-## 文件结构
+```bash
+curl http://127.0.0.1:8765/health
+```
 
+## 配置
+
+项目从 [`.env`](/home/grom/ozon_spider/.env) 和 [config.py](/home/grom/ozon_spider/config.py) 读取配置。
+
+当前关键配置：
+
+- `CHROME_BIN`
+  Chrome 可执行文件路径
+- `XVFB_DISPLAY`
+  虚拟显示器，默认 `:99`
+- `SELLER_ACCOUNTS`
+  seller 账号列表，格式：
+  `email:app_password:client_id,email2:app_password2:client_id2`
+
+示例：
+
+```env
+SELLER_ACCOUNTS=50713906@qq.com:app_password:3465475,xmdragon0808@163.com:app_password:3092234
 ```
-ozon_spider/
-├── config.py          # SKU 列表、超时、路径配置
-├── run.py             # 入口：Xvfb + Chrome 生命周期，自修复循环
-├── spider.py          # 主逻辑：CDP 接管、商品页抓取、稳定页判断
-├── extractor.py       # 数据提取：widgetStates 解析、页面状态分类
-├── chrome_launcher.py # 启动系统 Chrome + Xvfb
-├── slider_solver.py   # 滑块验证码求解（模板匹配 + 抛物线拟合）
-└── start.sh           # 快捷启动脚本
-```
+
+## 邮箱验证码
+
+seller 登录当前只支持这些邮箱类型：
+
+- `qq.com`
+- `163.com`
+- `126.com`
+
+相关逻辑在 [email_service.py](/home/grom/ozon_spider/email_service.py)。
+
+## 主要文件
+
+- [server.py](/home/grom/ozon_spider/server.py)
+  FastAPI 服务入口
+- [spider.py](/home/grom/ozon_spider/spider.py)
+  匿名商品抓取主逻辑
+- [spider_pool.py](/home/grom/ozon_spider/spider_pool.py)
+  匿名 spider worker pool
+- [extractor.py](/home/grom/ozon_spider/extractor.py)
+  商品数据提取和页面状态分类
+- [seller_login.py](/home/grom/ozon_spider/seller_login.py)
+  seller 会话管理、主备切换、登录恢复
+- [email_service.py](/home/grom/ozon_spider/email_service.py)
+  QQ / 163 IMAP 验证码收取
+- [chrome_launcher.py](/home/grom/ozon_spider/chrome_launcher.py)
+  Chrome / Xvfb 启动封装
+
+## 说明
+
+- 价格字段当前直接返回页面抓到的实时值
+- `GET /sku` 对 seller 尺寸重量是强依赖，seller 不可用时会返回失败
+- 运行时产生的浏览器 profile、cookies、seller state 不建议放在仓库目录内

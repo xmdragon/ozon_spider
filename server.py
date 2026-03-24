@@ -25,28 +25,25 @@ from config import (
     CHROME_BIN, CDP_PORT, XVFB_DISPLAY,
     SELLER_ACCOUNTS,
 )
-from chrome_launcher import start_chrome, kill, start_xvfb
-from spider import fetch_product, setup_page, load_cookies
-from seller_login import SellerSession, SELLER_CDP_PORT, get_seller_session_with_fallback
+from chrome_launcher import kill, start_xvfb
+from spider_pool import SpiderWorkerPool
+from seller_login import SellerSessionManager, SellerSessionUnavailable
 from playwright.async_api import async_playwright
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
+SPIDER_MIN_WORKERS = 1
+SPIDER_MAX_WORKERS = 2
+SPIDER_IDLE_WORKER_TTL_SECONDS = 90
+
 # ─── 全局状态 ───────────────────────────────────────────────────────────────
 
 class AppState:
     xvfb_proc = None
-    spider_chrome_proc = None
-    seller_session: Optional[SellerSession] = None
+    seller_manager: Optional[SellerSessionManager] = None
     spider_playwright = None
-    spider_browser = None
-    spider_context = None
-    spider_page = None
-    _lock: asyncio.Lock = None
-
-    def __init__(self):
-        self._lock = asyncio.Lock()
+    spider_pool: Optional[SpiderWorkerPool] = None
 
 state = AppState()
 
@@ -62,39 +59,28 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("Xvfb start failed (may already be running): %s", e)
 
-    # 启动 Spider Chrome
-    try:
-        state.spider_chrome_proc = start_chrome(CHROME_BIN, CDP_PORT, XVFB_DISPLAY)
-        log.info("Spider Chrome started on port %d", CDP_PORT)
-    except Exception as e:
-        log.error("Spider Chrome failed: %s", e)
-
-    # 初始化 spider playwright
+    # 初始化 spider worker pool
     try:
         state.spider_playwright = await async_playwright().start()
-        state.spider_browser = await state.spider_playwright.chromium.connect_over_cdp(
-            f"http://127.0.0.1:{CDP_PORT}"
+        state.spider_pool = SpiderWorkerPool(
+            state.spider_playwright,
+            CHROME_BIN,
+            XVFB_DISPLAY,
+            min_workers=SPIDER_MIN_WORKERS,
+            max_workers=SPIDER_MAX_WORKERS,
+            idle_ttl_seconds=SPIDER_IDLE_WORKER_TTL_SECONDS,
         )
-        state.spider_context = (
-            state.spider_browser.contexts[0]
-            if state.spider_browser.contexts
-            else await state.spider_browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow")
-        )
-        await load_cookies(state.spider_context)
-        state.spider_page = await setup_page(state.spider_context)
-        log.info("Spider browser ready")
+        await state.spider_pool.start()
+        log.info("Spider worker pool ready")
     except Exception as e:
-        log.error("Spider browser init failed: %s", e)
+        log.error("Spider worker pool init failed: %s", e)
 
-    # 启动 Seller session（后台，不阻塞启动）
+    # 启动 Seller session manager（后台，不阻塞启动）
     async def _init_seller():
         try:
-            session = await get_seller_session_with_fallback(SELLER_ACCOUNTS)
-            if session:
-                state.seller_session = session
-                log.info("Seller session ready, URL: %s", session.page.url)
-            else:
-                log.warning("All seller accounts failed — dimensions unavailable")
+            state.seller_manager = SellerSessionManager(SELLER_ACCOUNTS)
+            await state.seller_manager.start()
+            log.info("Seller session manager started")
         except Exception as e:
             log.error("Seller session init error: %s", e)
 
@@ -103,18 +89,12 @@ async def lifespan(app: FastAPI):
     yield
 
     # 关闭
-    if state.seller_session:
-        await state.seller_session.close()
-    if state.spider_page:
-        try: await state.spider_page.close()
-        except Exception: pass
-    if state.spider_context:
-        try: await state.spider_context.close()
-        except Exception: pass
+    if state.seller_manager:
+        await state.seller_manager.close()
+    if state.spider_pool:
+        await state.spider_pool.close()
     if state.spider_playwright:
         await state.spider_playwright.stop()
-    if state.spider_chrome_proc:
-        kill(state.spider_chrome_proc)
     if state.xvfb_proc:
         kill(state.xvfb_proc)
 
@@ -122,14 +102,36 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Ozon Spider API", lifespan=lifespan)
 
 
+def _normalize_dimensions_for_sku(dims: dict) -> dict:
+    def normalize_number(value):
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+
+    return {
+        "weight": normalize_number(dims.get("weight")),
+        "height": normalize_number(dims.get("height")),
+        "width": normalize_number(dims.get("width")),
+        "length": normalize_number(dims.get("depth")),
+    }
+
+
 # ─── 路由 ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
+    seller = {"ready": False}
+    if state.seller_manager:
+        seller = await state.seller_manager.health_snapshot()
+    spider = {"ready": False}
+    if state.spider_pool:
+        spider = await state.spider_pool.stats()
     return {
         "status": "ok",
-        "spider_ready": state.spider_page is not None,
-        "seller_ready": state.seller_session is not None,
+        "spider_ready": spider["ready"],
+        "seller_ready": seller["ready"],
+        "spider": spider,
+        "seller": seller,
     }
 
 
@@ -138,27 +140,39 @@ async def get_sku(sku: str = Query(..., description="Ozon SKU")):
     """
     抓取商品完整数据，自动补充尺寸重量（如果 seller session 就绪）。
     """
-    if state.spider_page is None:
-        raise HTTPException(503, "Spider browser not ready")
+    if not state.spider_pool:
+        raise HTTPException(503, "Spider page pool not ready")
 
-    async with state._lock:
-        try:
-            data = await fetch_product(state.spider_page, sku)
-        except Exception as e:
-            log.error("fetch_product error SKU %s: %s", sku, e)
-            raise HTTPException(500, str(e))
+    page = await state.spider_pool.acquire()
+    page_unhealthy = False
+    fetch_status = "unavailable"
+    try:
+        data, fetch_status = await page.fetch(sku)
+        if fetch_status == "blocked":
+            page_unhealthy = True
+    except Exception as e:
+        log.error("fetch_product error SKU %s: %s", sku, e)
+        page_unhealthy = True
+        raise HTTPException(500, str(e))
+    finally:
+        await state.spider_pool.release(page, unhealthy=page_unhealthy)
 
     if not data:
-        raise HTTPException(404, f"Product {sku} not found or blocked")
+        if fetch_status == "blocked":
+            raise HTTPException(503, f"Product {sku} blocked by upstream antibot")
+        raise HTTPException(404, f"Product {sku} not found or unavailable")
 
-    # 补充尺寸重量
-    if state.seller_session:
-        try:
-            dims = await state.seller_session.fetch_variant_model(sku)
-            if dims:
-                data["dimensions"] = dims
-        except Exception as e:
-            log.warning("fetch_variant_model error SKU %s: %s", sku, e)
+    # 尺寸重量是强依赖，seller 不可用时整条失败
+    if not state.seller_manager:
+        raise HTTPException(503, "Seller session manager not ready")
+    try:
+        dims = await state.seller_manager.call_with_failover("fetch_variant_model", sku)
+    except SellerSessionUnavailable as e:
+        log.warning("seller unavailable for SKU %s: %s", sku, e)
+        raise HTTPException(503, "Seller session unavailable")
+    if not dims:
+        raise HTTPException(502, f"Dimensions unavailable for SKU {sku}")
+    data["dimensions"] = _normalize_dimensions_for_sku(dims)
 
     return data
 
@@ -173,11 +187,14 @@ async def variant_model(req: SkuListRequest):
     批量查询 SKU 尺寸/重量。
     返回 {sku: {weight, depth, width, height}}
     """
-    if not state.seller_session:
-        raise HTTPException(503, "Seller session not ready")
+    if not state.seller_manager:
+        raise HTTPException(503, "Seller session manager not ready")
     results = {}
     for sku in req.skus:
-        dims = await state.seller_session.fetch_variant_model(sku)
+        try:
+            dims = await state.seller_manager.call_with_failover("fetch_variant_model", sku)
+        except SellerSessionUnavailable:
+            raise HTTPException(503, "Seller session unavailable")
         if dims:
             results[sku] = dims
     return {"dimensions": results, "total": len(results)}
@@ -188,9 +205,12 @@ async def data_v3(req: SkuListRequest):
     """
     批量查询 SKU 销售分析数据（seller data/v3）。
     """
-    if not state.seller_session:
-        raise HTTPException(503, "Seller session not ready")
-    result = await state.seller_session.fetch_data_v3(req.skus)
+    if not state.seller_manager:
+        raise HTTPException(503, "Seller session manager not ready")
+    try:
+        result = await state.seller_manager.call_with_failover("fetch_data_v3", req.skus)
+    except SellerSessionUnavailable:
+        raise HTTPException(503, "Seller session unavailable")
     return {"data": result}
 
 

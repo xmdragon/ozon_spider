@@ -2,7 +2,6 @@
 OZON 登录邮件服务
 
 使用 QQ/163 邮箱 IMAP 来接收验证码邮件
-仅支持国内邮箱（QQ、163），不支持 Gmail
 """
 
 import smtplib
@@ -12,13 +11,17 @@ import ssl
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import decode_header
+from email.utils import parseaddr
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import logging
 import asyncio
 
 logger = logging.getLogger(__name__)
+
+OZON_VERIFICATION_SUBJECT = "Подтверждение учетных данных Ozon"
+OZON_VERIFICATION_SENDER = "mailer@sender.ozon.ru"
 
 
 # 邮箱服务器配置
@@ -35,12 +38,6 @@ EMAIL_PROVIDERS = {
         'imap_host': 'imap.163.com',
         'imap_port': 993,
     },
-    'gmail': {
-        'smtp_host': 'smtp.gmail.com',
-        'smtp_port': 587,
-        'imap_host': 'imap.gmail.com',
-        'imap_port': 993,
-    },
 }
 
 
@@ -51,10 +48,8 @@ def _detect_email_provider(email: str) -> str:
         return 'qq'
     elif '@163.com' in email_lower or '@126.com' in email_lower:
         return '163'
-    elif '@gmail.com' in email_lower:
-        return 'gmail'
     else:
-        raise ValueError(f"不支持的邮箱类型: {email}，支持 QQ、163、Gmail")
+        raise ValueError(f"不支持的邮箱类型: {email}，仅支持 QQ、163/126")
 
 
 class EmailService:
@@ -65,7 +60,7 @@ class EmailService:
         初始化邮件服务
 
         Args:
-            email: 邮箱地址（支持 Gmail、QQ、163）
+            email: 邮箱地址（支持 QQ、163/126）
             app_password: 应用专用密码/授权码
         """
         self.email = email
@@ -77,11 +72,6 @@ class EmailService:
         self._provider = _detect_email_provider(email)
         self._config = EMAIL_PROVIDERS[self._provider]
         logger.info(f"邮箱服务商: {self._provider}, IMAP: {self._config['imap_host']}")
-
-    # 兼容旧代码
-    @property
-    def gmail(self):
-        return self.email
 
     def connect_smtp(self) -> smtplib.SMTP:
         """连接 SMTP 服务器"""
@@ -103,8 +93,155 @@ class EmailService:
                 timeout=30
             )
             self._imap_conn.login(self.email, self.app_password)
+            self._send_imap_id_if_needed(self._imap_conn)
             logger.info(f"IMAP 连接成功: {self.email} ({self._provider})")
         return self._imap_conn
+
+    def _send_imap_id_if_needed(self, imap_conn: imaplib.IMAP4_SSL) -> None:
+        """163/126 邮箱要求客户端在登录后发送 IMAP ID 信息。"""
+        if self._provider != '163':
+            return
+
+        capabilities = {
+            item.decode() if isinstance(item, bytes) else str(item)
+            for item in getattr(imap_conn, "capabilities", ())
+        }
+        if "ID" not in capabilities:
+            raise imaplib.IMAP4.error("163 IMAP 服务器未声明 ID capability")
+
+        imap_id = (
+            f'("name" "ozon_spider" '
+            f'"version" "1.0.0" '
+            f'"vendor" "ozon_spider" '
+            f'"support-email" "{self.email}")'
+        )
+        typ, data = imap_conn.xatom("ID", imap_id)
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"163 IMAP ID 发送失败: {data}")
+
+    def _parse_mailbox_list_item(self, raw_item: Any) -> Optional[Dict[str, Any]]:
+        text = raw_item.decode(errors='ignore') if isinstance(raw_item, bytes) else str(raw_item)
+        match = re.match(r'\((?P<flags>[^)]*)\)\s+"(?P<delimiter>[^"]*)"\s+(?P<name>.+)$', text)
+        if not match:
+            return None
+
+        flags_str = match.group("flags").strip()
+        flags = flags_str.split() if flags_str else []
+        name = match.group("name").strip()
+        if name.startswith('"') and name.endswith('"'):
+            name = name[1:-1]
+
+        return {
+            "flags": flags,
+            "delimiter": match.group("delimiter"),
+            "name": name,
+            "raw": text,
+        }
+
+    def list_mailboxes(self) -> List[Dict[str, Any]]:
+        imap = self.connect_imap()
+        typ, boxes = imap.list()
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"列出邮箱文件夹失败: {boxes}")
+
+        mailboxes = []
+        for raw_item in boxes or []:
+            parsed = self._parse_mailbox_list_item(raw_item)
+            if parsed:
+                mailboxes.append(parsed)
+        return mailboxes
+
+    def _resolve_special_folder(self, special_flag: str, fallback: Optional[str] = None) -> Optional[str]:
+        for mailbox in self.list_mailboxes():
+            if special_flag in mailbox["flags"]:
+                return mailbox["name"]
+        return fallback
+
+    def get_check_folders(self, check_spam: bool = True) -> List[str]:
+        folders = ["INBOX"]
+        if check_spam:
+            spam_folder = (
+                self._resolve_special_folder(r'\Junk')
+                or self._resolve_special_folder(r'\Spam')
+                or "Junk"
+            )
+            if spam_folder not in folders:
+                folders.append(spam_folder)
+        return folders
+
+    def select_folder(self, folder: str) -> None:
+        imap = self.connect_imap()
+        typ, data = imap.select(folder)
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"选择文件夹失败: {folder}: {data}")
+
+    def list_email_ids(self, folder: str = "INBOX") -> List[int]:
+        imap = self.connect_imap()
+        self.select_folder(folder)
+        typ, message_numbers = imap.search(None, "ALL")
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"搜索邮件失败: {folder}: {message_numbers}")
+        if not message_numbers or not message_numbers[0]:
+            return []
+        return [int(x) for x in message_numbers[0].split()]
+
+    def _parse_email_message(self, email_id: Any, msg) -> Dict[str, Any]:
+        from_header = msg.get("From", "")
+        subject = ""
+        subject_header = msg.get("Subject", "")
+        if subject_header:
+            decoded = decode_header(subject_header)
+            subject = "".join(
+                part.decode(encoding or 'utf-8') if isinstance(part, bytes) else part
+                for part, encoding in decoded
+            )
+
+        return {
+            "id": email_id.decode() if isinstance(email_id, bytes) else str(email_id),
+            "from": from_header,
+            "subject": subject,
+            "date": msg.get("Date", ""),
+            "body": self._get_email_body(msg),
+        }
+
+    def is_ozon_verification_email(self, from_header: str, subject: str) -> bool:
+        sender_email = parseaddr(from_header)[1].strip().lower()
+        normalized_subject = " ".join(subject.split())
+        return (
+            sender_email == OZON_VERIFICATION_SENDER
+            and normalized_subject == OZON_VERIFICATION_SUBJECT
+        )
+
+    def parse_email_datetime(self, date_header: str) -> Optional[datetime]:
+        try:
+            dt = email.utils.parsedate_to_datetime(date_header)
+        except Exception:
+            return None
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def is_email_within_seconds(self, date_header: str, max_age_seconds: int) -> bool:
+        dt = self.parse_email_datetime(date_header)
+        if dt is None:
+            return False
+        age_seconds = (datetime.now(timezone.utc) - dt).total_seconds()
+        return 0 <= age_seconds <= max_age_seconds
+
+    def fetch_email_by_id(self, folder: str, email_id: Any) -> Optional[Dict[str, Any]]:
+        imap = self.connect_imap()
+        self.select_folder(folder)
+        typ, msg_data = imap.fetch(str(email_id).encode(), "(RFC822)")
+        if typ != "OK":
+            raise imaplib.IMAP4.error(f"获取邮件失败: {folder} #{email_id}: {msg_data}")
+
+        for response_part in msg_data:
+            if isinstance(response_part, tuple):
+                msg = email.message_from_bytes(response_part[1])
+                return self._parse_email_message(email_id, msg)
+        return None
 
     def disconnect(self):
         """断开所有连接"""
@@ -143,7 +280,7 @@ class EmailService:
         """
         try:
             msg = MIMEMultipart()
-            msg['From'] = self.gmail
+            msg['From'] = self.email
             msg['To'] = to
             msg['Subject'] = subject
 
@@ -151,7 +288,7 @@ class EmailService:
             msg.attach(MIMEText(body, content_type, 'utf-8'))
 
             smtp = self.connect_smtp()
-            smtp.sendmail(self.gmail, to, msg.as_string())
+            smtp.sendmail(self.email, to, msg.as_string())
 
             logger.info(f"邮件发送成功: {to}, 主题: {subject}")
             return True
@@ -185,7 +322,7 @@ class EmailService:
 
         try:
             imap = self.connect_imap()
-            imap.select(folder)
+            self.select_folder(folder)
 
             # 搜索最近的邮件
             since_date = (datetime.now() - timedelta(minutes=minutes)).strftime("%d-%b-%Y")
@@ -194,7 +331,9 @@ class EmailService:
             if sender_filter:
                 search_criteria = f'(FROM "{sender_filter}" SINCE "{since_date}")'
 
-            _, message_numbers = imap.search(None, search_criteria)
+            typ, message_numbers = imap.search(None, search_criteria)
+            if typ != "OK":
+                raise imaplib.IMAP4.error(f"搜索邮件失败: {folder}: {message_numbers}")
 
             if not message_numbers[0]:
                 return emails
@@ -204,42 +343,22 @@ class EmailService:
             email_ids.reverse()
 
             for email_id in email_ids:
-                _, msg_data = imap.fetch(email_id, "(RFC822)")
+                typ, msg_data = imap.fetch(email_id, "(RFC822)")
+                if typ != "OK":
+                    logger.warning("获取邮件失败: %s #%s: %s", folder, email_id, msg_data)
+                    continue
 
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
                         msg = email.message_from_bytes(response_part[1])
-
-                        # 解析发件人
-                        from_header = msg.get("From", "")
-
-                        # 解析主题
-                        subject = ""
-                        subject_header = msg.get("Subject", "")
-                        if subject_header:
-                            decoded = decode_header(subject_header)
-                            subject = "".join(
-                                part.decode(encoding or 'utf-8') if isinstance(part, bytes) else part
-                                for part, encoding in decoded
-                            )
+                        parsed_mail = self._parse_email_message(email_id, msg)
+                        subject = parsed_mail["subject"]
 
                         # 主题过滤
                         if subject_filter and subject_filter.lower() not in subject.lower():
                             continue
 
-                        # 解析日期
-                        date_header = msg.get("Date", "")
-
-                        # 解析正文
-                        body = self._get_email_body(msg)
-
-                        emails.append({
-                            "id": email_id.decode(),
-                            "from": from_header,
-                            "subject": subject,
-                            "date": date_header,
-                            "body": body
-                        })
+                        emails.append(parsed_mail)
 
             return emails
 
@@ -290,23 +409,21 @@ class EmailService:
         Returns:
             验证码字符串，未找到返回 None
         """
-        folders = ["INBOX"]
-        if check_spam:
-            if self._provider == 'gmail':
-                folders.append("[Gmail]/Spam")
-            else:
-                folders.append("Junk")  # QQ/163 垃圾文件夹
+        folders = self.get_check_folders(check_spam=check_spam)
 
         for folder in folders:
             try:
                 emails = self.get_recent_emails(
                     folder=folder,
-                    sender_filter="ozon",
                     minutes=minutes,
-                    limit=5
+                    limit=10
                 )
 
                 for mail in emails:
+                    if not self.is_ozon_verification_email(mail["from"], mail["subject"]):
+                        continue
+                    if not self.is_email_within_seconds(mail["date"], 60):
+                        continue
                     code = self._extract_ozon_code(mail["body"], mail["subject"])
                     if code:
                         logger.info(f"找到 OZON 验证码: {code} (来自 {folder})")
@@ -426,32 +543,32 @@ async def get_email_service_from_config() -> Optional[EmailService]:
             if isinstance(config, str):
                 config = json.loads(config)
 
-            gmail = config.get("gmail", "")
+            email_address = config.get("email", "")
             app_password = config.get("app_password", "")
 
-            if not gmail or not app_password:
-                logger.warning("Gmail 或应用密码未配置")
+            if not email_address or not app_password:
+                logger.warning("邮箱地址或应用密码未配置")
                 return None
 
-            return EmailService(gmail, app_password)
+            return EmailService(email_address, app_password)
 
     except Exception as e:
         logger.error(f"获取邮件服务配置失败: {e}")
         return None
 
 
-def get_email_service_sync(gmail: str, app_password: str) -> EmailService:
+def get_email_service_sync(email_address: str, app_password: str) -> EmailService:
     """
     直接创建邮件服务实例（同步版本）
 
     Args:
-        gmail: Gmail 邮箱地址
+        email_address: 邮箱地址
         app_password: 应用专用密码
 
     Returns:
         EmailService 实例
     """
-    return EmailService(gmail, app_password)
+    return EmailService(email_address, app_password)
 
 
 # 测试函数
@@ -463,7 +580,7 @@ async def test_email_service():
         print("❌ 无法获取邮件服务配置")
         return
 
-    print(f"✓ 邮件服务配置获取成功: {service.gmail}")
+    print(f"✓ 邮件服务配置获取成功: {service.email}")
 
     # 测试 IMAP 连接
     try:

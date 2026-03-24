@@ -1,5 +1,7 @@
 __pycache__/
+.venv_input/
 seller_profile_*/
+seller_chrome_profile/
 seller_state*.json
 .env
 *.pyc
@@ -9,3 +11,7 @@ results.json
 product.html
 *.log
 .env
+adult_after_fill_blank.json
+adult_after_fill_blank.png
+observe_*.json
+tmp_eval_verified_script.py

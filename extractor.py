@@ -4,15 +4,59 @@ Extract product data from a stable Ozon product page.
 import re
 import json
 import logging
+import time
+import weakref
 
 log = logging.getLogger(__name__)
+
+_PAGE_OBSERVATIONS = weakref.WeakKeyDictionary()
+
+
+def _page_observation(page):
+    obs = _PAGE_OBSERVATIONS.get(page)
+    if obs is None:
+        obs = {
+            "last_main_nav_at": 0.0,
+            "last_main_response_status": None,
+            "last_main_response_url": "",
+        }
+        _PAGE_OBSERVATIONS[page] = obs
+    return obs
+
+
+def attach_page_observers(page) -> None:
+    obs = _page_observation(page)
+    if obs.get("attached"):
+        return
+
+    obs["attached"] = True
+    obs["last_main_nav_at"] = time.monotonic()
+
+    def on_frame_navigated(frame):
+        try:
+            if frame == page.main_frame:
+                obs["last_main_nav_at"] = time.monotonic()
+        except Exception:
+            pass
+
+    def on_response(resp):
+        try:
+            req = resp.request
+            if req.resource_type == "document" and req.frame == page.main_frame and req.is_navigation_request():
+                obs["last_main_response_status"] = resp.status
+                obs["last_main_response_url"] = resp.url
+        except Exception:
+            pass
+
+    page.on("framenavigated", on_frame_navigated)
+    page.on("response", on_response)
 
 
 def _calculate_real_price(card_price: float, price: float) -> float:
     """Mirror of calculateRealPriceCore from extension."""
     if card_price > 0 and price > card_price:
-        return round((price - card_price) * 2.2 + price, 2)
-    return round(price, 2)
+        return round((price - card_price) * 2.2 + price)
+    return round(price)
 
 
 def _clean_price(s: str) -> float:
@@ -27,6 +71,71 @@ def _clean_price(s: str) -> float:
         return float(s)
     except ValueError:
         return 0.0
+
+
+def _normalize_ozon_image_url(url: str) -> str:
+    if not url:
+        return ""
+    url = re.sub(r"^https://ir-\d+\.ozonstatic\.cn/", "https://ir.ozone.ru/", url)
+    return url
+
+
+def _to_wc_image_url(url: str, size: int) -> str:
+    if not url:
+        return ""
+    clean_url = re.sub(r"/wc\d+/", "/", url)
+    idx = clean_url.rfind("/")
+    if idx == -1:
+        return clean_url
+    return f"{clean_url[:idx]}/wc{size}{clean_url[idx:]}"
+
+
+def _merge_attributes(existing: list[dict], extra: list[dict]) -> list[dict]:
+    seen = {
+        (
+            str(item.get("key") or ""),
+            str(item.get("name") or ""),
+            str(item.get("value") or ""),
+        )
+        for item in existing
+    }
+    merged = list(existing)
+    for item in extra:
+        sig = (
+            str(item.get("key") or ""),
+            str(item.get("name") or ""),
+            str(item.get("value") or ""),
+        )
+        if sig not in seen:
+            seen.add(sig)
+            merged.append(item)
+    return merged
+
+
+def _find_attr_value(attributes: list[dict], *keys: str) -> str:
+    for item in attributes:
+        key = str(item.get("key") or "")
+        name = str(item.get("name") or "")
+        if key in keys or name in keys:
+            return str(item.get("value") or "").strip()
+    return ""
+
+
+def _format_size_for_spec(size_value: str) -> str:
+    if not size_value:
+        return ""
+    parts = [p.strip() for p in size_value.split(",") if p.strip()]
+    if len(parts) >= 2:
+        return f"{parts[0]}–{parts[-1]} RU"
+    return parts[0]
+
+
+def _build_specifications(attributes: list[dict]) -> str:
+    color = _find_attr_value(attributes, "Color", "Цвет")
+    ru_size = _format_size_for_spec(_find_attr_value(attributes, "RussianSizeClothes", "Российский размер"))
+    maker_size = _find_attr_value(attributes, "SizeManufacturer", "Размер производителя")
+    parts = [p for p in [color, ru_size, maker_size] if p]
+    return " / ".join(parts)
 
 
 def extract_variant_from_api(page1_widget_states: dict, page2_widget_states: dict, sku: str) -> dict:
@@ -49,6 +158,7 @@ def extract_variant_from_api(page1_widget_states: dict, page2_widget_states: dic
         "description": "",
         "attributes": [],
         "typeNameRu": "",
+        "link": "",
     }
 
     # ── PAGE 1 ──────────────────────────────────────────────
@@ -85,11 +195,46 @@ def extract_variant_from_api(page1_widget_states: dict, page2_widget_states: dic
             gd = json.loads(page1_widget_states[gallery_key])
             imgs = gd.get('images', [])
             result['images'] = [
-                {'url': img['src'], 'is_primary': i == 0}
+                {'url': _normalize_ozon_image_url(img['src']), 'is_primary': i == 0}
                 for i, img in enumerate(imgs) if img.get('src')
             ]
             if result['images']:
-                result['image_url'] = result['images'][0]['url']
+                result['image_url'] = _to_wc_image_url(result['images'][0]['url'], 140)
+        except Exception:
+            pass
+
+    # aspects / current variant metadata
+    aspects_key = next((k for k in keys1 if 'webAspects' in k), None)
+    if aspects_key:
+        try:
+            ad = json.loads(page1_widget_states[aspects_key])
+            aspects = ad.get('aspects', []) or []
+            spec_parts = []
+            current_link = ""
+            for aspect in aspects:
+                variants = aspect.get("variants") or []
+                current_variant = next(
+                    (
+                        v for v in variants
+                        if str(v.get("sku") or "") == sku
+                    ),
+                    None,
+                ) or next(
+                    (
+                        v for v in variants
+                        if v.get("active") or v.get("isSelected")
+                    ),
+                    None,
+                )
+                if current_variant:
+                    current_link = current_link or str(current_variant.get("link") or "")
+                    searchable = (((current_variant.get("data") or {}).get("searchableText")) or "").strip()
+                    if searchable:
+                        spec_parts.append(searchable)
+            if spec_parts:
+                result["specifications"] = " / ".join(spec_parts)
+            if current_link:
+                result["link"] = current_link.split("?", 1)[0]
         except Exception:
             pass
 
@@ -119,7 +264,7 @@ def extract_variant_from_api(page1_widget_states: dict, page2_widget_states: dic
         except Exception:
             pass
 
-    # description + fallback attributes from webDescription
+    # description + merge extra attributes from webDescription
     desc_keys = [k for k in keys2 if 'webDescription' in k and 'pdpPage2column' in k]
     for dk in desc_keys:
         try:
@@ -130,20 +275,30 @@ def extract_variant_from_api(page1_widget_states: dict, page2_widget_states: dic
                         dd.get('description') or dd.get('text') or '')
                 if desc:
                     result['description'] = desc
-            if not result['attributes']:
-                chars = dd.get('characteristics', [])
-                if chars:
-                    result['attributes'] = [
-                        {'attribute_id': 0, 'key': c.get('title', ''), 'name': c.get('title', ''), 'value': c.get('content', '')}
-                        for c in chars if c.get('title') and c.get('content')
-                    ]
+            chars = dd.get('characteristics', [])
+            if chars:
+                extra_attrs = [
+                    {
+                        'attribute_id': 0,
+                        'key': c.get('title', ''),
+                        'name': c.get('title', ''),
+                        'value': c.get('content', ''),
+                    }
+                    for c in chars
+                    if c.get('title') and c.get('content')
+                ]
+                result['attributes'] = _merge_attributes(result['attributes'], extra_attrs)
         except Exception:
             pass
+
+    if not result["specifications"]:
+        result["specifications"] = _build_specifications(result["attributes"])
 
     return result
 
 # Page state classification
 STATE_PRODUCT = "product"
+STATE_ADULT = "adult_confirm"
 STATE_SLIDER = "challenge_slider"
 STATE_CHALLENGE = "challenge_wait"
 STATE_BLOCKED = "blocked"
@@ -156,12 +311,49 @@ async def classify_page(page) -> str:
         url = page.url
         title = await page.title()
         title_lower = title.lower()
+        obs = _page_observation(page)
+        nav_age = time.monotonic() - float(obs.get("last_main_nav_at") or 0.0)
 
         # Hard block
         if "доступ ограничен" in title_lower or "access denied" in title_lower:
-            return STATE_BLOCKED
-        if "403" in title or "403" in url:
-            return STATE_BLOCKED
+            body_text = await page.text_content("body") or ""
+            body_lower = body_text.lower()
+            has_access_limited_text = (
+                "доступ ограничен" in body_lower
+                or ("доступ" in body_lower and "огранич" in body_lower)
+                or "access denied" in body_lower
+            )
+            has_incident = "инцидент" in body_lower or "incident" in body_lower
+            if (
+                obs.get("last_main_response_status") == 403
+                and has_access_limited_text
+                and has_incident
+                and nav_age >= 1.5
+            ):
+                return STATE_BLOCKED
+            return STATE_CHALLENGE
+
+        # Product pages are the hot path; check them before serializing full HTML.
+        if any(k in url for k in ["/product/", "/products/"]):
+            name_el = await page.query_selector("h1")
+            if name_el:
+                return STATE_PRODUCT
+
+        adult_modal = await page.query_selector('[data-widget="userAdultModal"]')
+        if adult_modal:
+            return STATE_ADULT
+
+        try:
+            body_text = await page.text_content("body") or ""
+        except Exception:
+            body_text = ""
+        body_lower = body_text.lower()
+        if (
+            "подтвердите возраст" in body_lower
+            or "дату вашего рождения" in body_lower
+            or "please indicate your date of birth" in body_lower
+        ):
+            return STATE_ADULT
 
         # Check for slider challenge
         slider = await page.query_selector(
@@ -175,6 +367,11 @@ async def classify_page(page) -> str:
         # Title-based: only match if title IS the challenge page title
         if any(k in title_lower for k in ["antibot captcha", "checking", "challenge", "проверка", "подождите"]):
             return STATE_CHALLENGE
+
+        # Ozon home/category page — treated as non-product but not blocked
+        if "ozon.ru" in url and "/product/" not in url:
+            return "home"
+
         # Content-based: use very specific markers only present on actual challenge pages
         content = await page.content()
         if any(k in content for k in ["cdn-cgi/challenge", "cf-browser-verification", "__cf_chl"]):
@@ -182,17 +379,6 @@ async def classify_page(page) -> str:
         # Ozon-specific antibot challenge page (not just the word in JSON bundles)
         if 'id="captcha-container"' in content or 'id="captcha"' in content:
             return STATE_CHALLENGE
-
-        # Product page signals
-        if any(k in url for k in ["/product/", "/products/"]):
-            # Verify product data is present
-            name_el = await page.query_selector("h1")
-            if name_el:
-                return STATE_PRODUCT
-
-        # Ozon home/category page — treated as non-product but not blocked
-        if "ozon.ru" in url and "/product/" not in url:
-            return "home"
 
         return STATE_UNKNOWN
     except Exception as e:
