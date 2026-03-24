@@ -34,13 +34,15 @@ def start_chrome(
     chrome_bin: str,
     cdp_port: int,
     display: str = None,
+    user_data_dir: str = None,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     if display:
         env["DISPLAY"] = display
     elif "DISPLAY" not in env:
         env["DISPLAY"] = ":0"
-    user_data_dir = _make_user_data_dir()
+    if user_data_dir is None:
+        user_data_dir = _make_user_data_dir()
     cmd = [
         chrome_bin,
         f"--remote-debugging-port={cdp_port}",

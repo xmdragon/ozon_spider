@@ -53,9 +53,12 @@ class SellerSession:
         """
         from playwright.async_api import async_playwright
 
-        # 启动独立 Chrome 实例
+        # 启动独立 Chrome 实例（固定 user-data-dir，持久化 cookies）
         os.environ["DISPLAY"] = XVFB_DISPLAY
-        self._chrome_proc = start_chrome(CHROME_BIN, SELLER_CDP_PORT, XVFB_DISPLAY)
+        seller_profile = Path("seller_chrome_profile")
+        seller_profile.mkdir(exist_ok=True)
+        self._chrome_proc = start_chrome(CHROME_BIN, SELLER_CDP_PORT, XVFB_DISPLAY,
+                                         user_data_dir=str(seller_profile.absolute()))
 
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.connect_over_cdp(
@@ -81,14 +84,17 @@ class SellerSession:
             with open(self.storage_state_file, encoding="utf-8") as f:
                 state = json.load(f)
             cookies = state.get("cookies", [])
-            if cookies:
-                await self._context.add_cookies(cookies)
-            await self._page.goto(SELLER_DASHBOARD, timeout=30000, wait_until="domcontentloaded")
-            await asyncio.sleep(3)
-            url = self._page.url
-            if "signin" in url or "ozonid" in url or "registration" in url:
+            if not cookies:
                 return False
-            log.info("session 验证通过，URL: %s", url)
+            await self._context.add_cookies(cookies)
+            await self._page.goto(SELLER_DASHBOARD, timeout=30000, wait_until="domcontentloaded")
+            await asyncio.sleep(5)
+            url = self._page.url
+            log.info("恢复 session 后 URL: %s", url)
+            # 只有确实在 signin/ozonid/sso 才算失败
+            if any(k in url for k in ["signin", "ozonid", "sso.ozon"]):
+                return False
+            log.info("session 验证通过")
             return True
         except Exception as e:
             log.warning("恢复 session 失败: %s", e)
