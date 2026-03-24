@@ -1,5 +1,6 @@
 __pycache__/
 seller_chrome_profile/
+.env
 *.pyc
 *.pyo
 cookies.json

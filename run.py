@@ -13,7 +13,7 @@ import os
 import requests
 
 from config import (
-    SKUS, CHROME_BIN, CDP_PORT, XVFB_DISPLAY,
+    CHROME_BIN, CDP_PORT, XVFB_DISPLAY,
     SUCCESS_THRESHOLD, OUTPUT_FILE,
 )
 from chrome_launcher import start_xvfb, start_chrome, kill
@@ -41,7 +41,14 @@ async def main():
     all_results = []
     consecutive_successes = 0
     attempt = 0
-    skus = SKUS.copy()
+    # SKUs from command-line args or env var
+    if len(sys.argv) > 1:
+        skus = sys.argv[1:]
+    elif os.getenv("SKUS"):
+        skus = os.getenv("SKUS").split(",")
+    else:
+        log.error("No SKUs provided. Usage: python3 run.py SKU1 SKU2 ... or set SKUS env var")
+        sys.exit(1)
     max_attempts = 10
 
     while consecutive_successes < SUCCESS_THRESHOLD and attempt < max_attempts:
