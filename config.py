@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -7,6 +8,8 @@ if _env.exists():
         if _line.strip() and not _line.startswith("#") and "=" in _line:
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip())
+
+_account_file = Path(__file__).parent / "account.json"
 
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/google-chrome-stable")
 CDP_PORT = int(os.getenv("CDP_PORT", "9223"))
@@ -22,16 +25,40 @@ SUCCESS_THRESHOLD = 3
 OUTPUT_FILE = "results.json"
 
 # Seller accounts: list of {email, app_password, client_id}
-# From SELLER_ACCOUNTS env: "email:pass:id,email2:pass2:id2"
-def _parse_seller_accounts():
+def _load_seller_accounts():
+    if not _account_file.exists():
+        return []
+
+    try:
+        payload = json.loads(_account_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[config] failed to read account.json: {e}")
+        return []
+
+    if isinstance(payload, dict):
+        raw_accounts = payload.get("seller_accounts", [])
+    elif isinstance(payload, list):
+        raw_accounts = payload
+    else:
+        print("[config] account.json must be an array or {\"seller_accounts\": [...]} format")
+        return []
+
     accounts = []
-    for entry in os.getenv("SELLER_ACCOUNTS", "").split(","):
-        parts = entry.strip().split(":")
-        if len(parts) == 3:
-            accounts.append({"email": parts[0], "app_password": parts[1], "client_id": parts[2]})
+    for item in raw_accounts:
+        if not isinstance(item, dict):
+            continue
+        email = str(item.get("email", "")).strip()
+        app_password = str(item.get("app_password", "")).strip()
+        client_id = str(item.get("client_id", "")).strip()
+        if email and app_password and client_id:
+            accounts.append({
+                "email": email,
+                "app_password": app_password,
+                "client_id": client_id,
+            })
     return accounts
 
-SELLER_ACCOUNTS = _parse_seller_accounts()
+SELLER_ACCOUNTS = _load_seller_accounts()
 # Default (first account) for backwards compat
 SELLER_EMAIL = SELLER_ACCOUNTS[0]["email"] if SELLER_ACCOUNTS else ""
 SELLER_EMAIL_APP_PASSWORD = SELLER_ACCOUNTS[0]["app_password"] if SELLER_ACCOUNTS else ""

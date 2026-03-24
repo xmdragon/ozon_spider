@@ -77,7 +77,7 @@ curl http://127.0.0.1:8765/health
 
 ## 配置
 
-项目从 [`.env`](/home/grom/ozon_spider/.env) 和 [config.py](/home/grom/ozon_spider/config.py) 读取配置。
+项目从 [config.py](/home/grom/ozon_spider/config.py)、[`.env`](/home/grom/ozon_spider/.env) 和本地 `account.json` 读取配置。
 
 当前关键配置：
 
@@ -85,15 +85,31 @@ curl http://127.0.0.1:8765/health
   Chrome 可执行文件路径
 - `XVFB_DISPLAY`
   虚拟显示器，默认 `:99`
-- `SELLER_ACCOUNTS`
-  seller 账号列表，格式：
-  `email:app_password:client_id,email2:app_password2:client_id2`
+- `account.json`
+  seller 账号列表，支持两种格式：
+  - 顶层数组
+  - `{"seller_accounts": [...]}`
 
 示例：
 
-```env
-SELLER_ACCOUNTS=50713906@qq.com:app_password:3465475,xmdragon0808@163.com:app_password:3092234
+```json
+{
+  "seller_accounts": [
+    {
+      "email": "50713906@qq.com",
+      "app_password": "app_password",
+      "client_id": "3465475"
+    },
+    {
+      "email": "xmdragon0808@163.com",
+      "app_password": "app_password",
+      "client_id": "3092234"
+    }
+  ]
+}
 ```
+
+跟踪仓库用 [account.example.json](/home/grom/ozon_spider/account.example.json) 作为模板；本地实际 `account.json` 已加入忽略，不会进版本库。
 
 ## 邮箱验证码
 

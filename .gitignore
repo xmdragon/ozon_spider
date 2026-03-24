@@ -4,13 +4,13 @@ seller_profile_*/
 seller_chrome_profile/
 seller_state*.json
 .env
+account.json
 *.pyc
 *.pyo
 cookies.json
 results.json
 product.html
 *.log
-.env
 adult_after_fill_blank.json
 adult_after_fill_blank.png
 observe_*.json

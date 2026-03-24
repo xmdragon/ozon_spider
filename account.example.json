@@ -1,0 +1,14 @@
+{
+  "seller_accounts": [
+    {
+      "email": "your@qq.com",
+      "app_password": "app_password",
+      "client_id": "3465475"
+    },
+    {
+      "email": "another@163.com",
+      "app_password": "app_password2",
+      "client_id": "3092234"
+    }
+  ]
+}
