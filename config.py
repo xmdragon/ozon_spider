@@ -21,9 +21,20 @@ SLIDER_TIMEOUT = 20
 SUCCESS_THRESHOLD = 3
 OUTPUT_FILE = "results.json"
 
-# Seller login config
-SELLER_EMAIL = os.getenv("SELLER_EMAIL", "")
-SELLER_EMAIL_APP_PASSWORD = os.getenv("SELLER_EMAIL_APP_PASSWORD", "")
-SELLER_CLIENT_ID = os.getenv("SELLER_CLIENT_ID", "")
-SELLER_STORAGE_STATE = os.getenv("SELLER_STORAGE_STATE", "seller_state.json")
+# Seller accounts: list of {email, app_password, client_id}
+# From SELLER_ACCOUNTS env: "email:pass:id,email2:pass2:id2"
+def _parse_seller_accounts():
+    accounts = []
+    for entry in os.getenv("SELLER_ACCOUNTS", "").split(","):
+        parts = entry.strip().split(":")
+        if len(parts) == 3:
+            accounts.append({"email": parts[0], "app_password": parts[1], "client_id": parts[2]})
+    return accounts
+
+SELLER_ACCOUNTS = _parse_seller_accounts()
+# Default (first account) for backwards compat
+SELLER_EMAIL = SELLER_ACCOUNTS[0]["email"] if SELLER_ACCOUNTS else ""
+SELLER_EMAIL_APP_PASSWORD = SELLER_ACCOUNTS[0]["app_password"] if SELLER_ACCOUNTS else ""
+SELLER_CLIENT_ID = SELLER_ACCOUNTS[0]["client_id"] if SELLER_ACCOUNTS else ""
+SELLER_STORAGE_STATE = "seller_state.json"
 SELLER_LOGIN_URL = "https://seller.ozon.ru/"

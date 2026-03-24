@@ -23,11 +23,11 @@ from pydantic import BaseModel
 
 from config import (
     CHROME_BIN, CDP_PORT, XVFB_DISPLAY,
-    SELLER_EMAIL, SELLER_EMAIL_APP_PASSWORD, SELLER_CLIENT_ID, SELLER_STORAGE_STATE,
+    SELLER_ACCOUNTS,
 )
 from chrome_launcher import start_chrome, kill, start_xvfb
 from spider import fetch_product, setup_page, load_cookies
-from seller_login import SellerSession, SELLER_CDP_PORT
+from seller_login import SellerSession, SELLER_CDP_PORT, get_seller_session_with_fallback
 from playwright.async_api import async_playwright
 
 log = logging.getLogger(__name__)
@@ -89,16 +89,12 @@ async def lifespan(app: FastAPI):
     # 启动 Seller session（后台，不阻塞启动）
     async def _init_seller():
         try:
-            session = SellerSession(
-                SELLER_EMAIL, SELLER_EMAIL_APP_PASSWORD,
-                SELLER_CLIENT_ID, SELLER_STORAGE_STATE,
-            )
-            ok = await session.start()
-            if ok:
+            session = await get_seller_session_with_fallback(SELLER_ACCOUNTS)
+            if session:
                 state.seller_session = session
                 log.info("Seller session ready, URL: %s", session.page.url)
             else:
-                log.warning("Seller session login failed — dimensions unavailable")
+                log.warning("All seller accounts failed — dimensions unavailable")
         except Exception as e:
             log.error("Seller session init error: %s", e)
 

@@ -1,5 +1,6 @@
 __pycache__/
-seller_chrome_profile/
+seller_profile_*/
+seller_state*.json
 .env
 *.pyc
 *.pyo

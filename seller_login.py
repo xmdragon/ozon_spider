@@ -53,9 +53,10 @@ class SellerSession:
         """
         from playwright.async_api import async_playwright
 
-        # 启动独立 Chrome 实例（固定 user-data-dir，持久化 cookies）
+        # 每个账号使用独立的 Chrome profile（按 email 区分）
         os.environ["DISPLAY"] = XVFB_DISPLAY
-        seller_profile = Path("seller_chrome_profile")
+        profile_name = "seller_profile_" + self.email.split("@")[0]
+        seller_profile = Path(profile_name)
         seller_profile.mkdir(exist_ok=True)
         self._chrome_proc = start_chrome(CHROME_BIN, SELLER_CDP_PORT, XVFB_DISPLAY,
                                          user_data_dir=str(seller_profile.absolute()))
@@ -461,4 +462,25 @@ async def get_seller_session(
     if ok:
         return session
     await session.close()
+    return None
+
+
+async def get_seller_session_with_fallback(accounts: list) -> Optional[SellerSession]:
+    """
+    尝试多个账号，返回第一个成功的 SellerSession。
+    accounts: [{email, app_password, client_id}, ...]
+    每个账号使用独立的 storage_state 文件（seller_state_{email}.json）。
+    """
+    for acct in accounts:
+        email = acct["email"]
+        storage = f"seller_state_{email.split('@')[0]}.json"
+        log.info("尝试账号: %s", email)
+        session = await get_seller_session(
+            email, acct["app_password"], acct["client_id"], storage
+        )
+        if session:
+            log.info("✓ 账号 %s 登录成功", email)
+            return session
+        log.warning("账号 %s 登录失败，尝试下一个", email)
+    log.error("所有账号登录均失败")
     return None

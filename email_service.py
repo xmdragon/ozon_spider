@@ -21,7 +21,7 @@ import asyncio
 logger = logging.getLogger(__name__)
 
 
-# 邮箱服务器配置（仅支持国内邮箱）
+# 邮箱服务器配置
 EMAIL_PROVIDERS = {
     'qq': {
         'smtp_host': 'smtp.qq.com',
@@ -35,18 +35,26 @@ EMAIL_PROVIDERS = {
         'imap_host': 'imap.163.com',
         'imap_port': 993,
     },
+    'gmail': {
+        'smtp_host': 'smtp.gmail.com',
+        'smtp_port': 587,
+        'imap_host': 'imap.gmail.com',
+        'imap_port': 993,
+    },
 }
 
 
 def _detect_email_provider(email: str) -> str:
-    """根据邮箱地址检测邮箱服务商（仅支持 QQ、163）"""
+    """根据邮箱地址检测邮箱服务商"""
     email_lower = email.lower()
     if '@qq.com' in email_lower:
         return 'qq'
     elif '@163.com' in email_lower or '@126.com' in email_lower:
         return '163'
+    elif '@gmail.com' in email_lower:
+        return 'gmail'
     else:
-        raise ValueError(f"不支持的邮箱类型: {email}，仅支持 QQ 邮箱和 163 邮箱")
+        raise ValueError(f"不支持的邮箱类型: {email}，支持 QQ、163、Gmail")
 
 
 class EmailService:
@@ -284,7 +292,10 @@ class EmailService:
         """
         folders = ["INBOX"]
         if check_spam:
-            folders.append("Junk")  # QQ邮箱垃圾文件夹
+            if self._provider == 'gmail':
+                folders.append("[Gmail]/Spam")
+            else:
+                folders.append("Junk")  # QQ/163 垃圾文件夹
 
         for folder in folders:
             try:
