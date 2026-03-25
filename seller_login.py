@@ -21,6 +21,10 @@ log = logging.getLogger(__name__)
 SELLER_CDP_PORT = 9224
 SELLER_DASHBOARD = "https://seller.ozon.ru/app/dashboard"
 SELLER_LOGIN_URL = "https://seller.ozon.ru/"
+SELLER_LOGIN_READY_TIMEOUT = 60
+SELLER_LOGIN_POLL_INTERVAL = 0.25
+SELLER_LOGIN_CHALLENGE_POLL_INTERVAL = 0.5
+SELLER_LOGIN_LOADSTATE_TIMEOUT_MS = 500
 
 
 class SellerSessionUnavailable(RuntimeError):
@@ -59,6 +63,76 @@ class SellerSession:
             and not any(k in url for k in ("signin", "ozonid", "sso", "registration"))
         )
 
+    async def _read_page_text(self) -> str:
+        try:
+            body = await self._page.text_content("body") or ""
+        except Exception:
+            body = ""
+        return " ".join(body.split())
+
+    async def _is_seller_challenge_page(self) -> bool:
+        try:
+            title = (await self._page.title() or "").strip().lower()
+        except Exception:
+            title = ""
+        body = (await self._read_page_text()).lower()
+        return (
+            ("доступ ограничен" in title or "access denied" in title)
+            or "пожалуйста, включите javascript для продолжения" in body
+            or "please, enable javascript for continue" in body
+            or "нам нужно убедиться, что вы не робот" in body
+            or "we need to make sure that you are not a robot" in body
+        )
+
+    async def _has_login_surface(self) -> bool:
+        selectors = [
+            'button[type="submit"]:has-text("登录")',
+            'button:has-text("Войти")',
+            'button:has-text("по почте")',
+            'button:has-text("邮箱")',
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[type="tel"]',
+        ]
+        for sel in selectors:
+            try:
+                if await self._page.query_selector(sel):
+                    return True
+            except Exception:
+                pass
+        body = await self._read_page_text()
+        return (
+            "Войти по почте" in body
+            or "使用邮箱登录" in body
+            or "下一步" in body
+            or "Далее" in body
+        )
+
+    async def _wait_for_login_ready(self, label: str, timeout: int = SELLER_LOGIN_READY_TIMEOUT) -> str:
+        deadline = time.time() + timeout
+        saw_challenge = False
+        while time.time() < deadline:
+            url = self._page.url
+            if self._is_authenticated_seller_url(url):
+                return "authenticated"
+            if await self._is_seller_challenge_page():
+                if not saw_challenge:
+                    saw_challenge = True
+                    log.info("%s 检测到 seller anti-bot 过渡页，等待其自动跳转", label)
+                await asyncio.sleep(SELLER_LOGIN_CHALLENGE_POLL_INTERVAL)
+                continue
+            if await self._has_login_surface():
+                return "ready"
+            try:
+                await self._page.wait_for_load_state(
+                    "domcontentloaded",
+                    timeout=SELLER_LOGIN_LOADSTATE_TIMEOUT_MS,
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
+        return "timeout"
+
     async def _find_email_input(self):
         email_input = await self._page.query_selector(
             'input[type="email"], input[name="email"], '
@@ -73,6 +147,40 @@ class SellerSession:
             if t in ('text', 'email', ''):
                 return inp
         return None
+
+    async def _fill_email_input(self, email: str) -> bool:
+        selectors = [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[placeholder*="почт"]',
+            'input[placeholder*="email"]',
+        ]
+        for _ in range(20):
+            for sel in selectors:
+                try:
+                    locator = self._page.locator(sel).first
+                    if await locator.count() == 0:
+                        continue
+                    await locator.fill(email)
+                    return True
+                except Exception as e:
+                    if "not attached" not in str(e).lower():
+                        continue
+            try:
+                inputs = await self._page.query_selector_all("input")
+                for inp in inputs:
+                    try:
+                        t = await inp.get_attribute("type") or "text"
+                        if t not in ("text", "email", ""):
+                            continue
+                        await inp.fill(email)
+                        return True
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+        return False
 
     async def _click_next_button(self) -> bool:
         try:
@@ -201,7 +309,17 @@ class SellerSession:
         )
         self._context = self._browser.contexts[0] if self._browser.contexts else \
             await self._browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow")
-        self._page = await self._context.new_page()
+        pages = [p for p in self._context.pages if not p.is_closed()]
+        blank_pages = [p for p in pages if p.url in ("", "about:blank")]
+        if blank_pages:
+            self._page = blank_pages[0]
+            for extra in blank_pages[1:]:
+                try:
+                    await extra.close()
+                except Exception:
+                    pass
+        else:
+            self._page = await self._context.new_page()
 
         # 尝试恢复已有 session
         if self.storage_state_file.exists():
@@ -255,19 +373,38 @@ class SellerSession:
                 await asyncio.sleep(3)
 
             log.info("登录页 URL: %s", self._page.url)
-            await asyncio.sleep(3)
+            ready_state = await self._wait_for_login_ready("进入登录页后", timeout=60)
+            log.info("登录页就绪状态: %s | URL: %s", ready_state, self._page.url)
+            if ready_state == "authenticated":
+                return True
+            if ready_state == "timeout":
+                log.warning("seller 登录页在等待 anti-bot 跳转后仍未就绪，URL: %s", self._page.url)
+                return False
 
             # 步骤1: 点击「登录」按钮
             login_btn = await self._page.query_selector('button[type="submit"]:has-text("登录"), button:has-text("Войти")')
             if login_btn:
                 await login_btn.evaluate('el => el.click()')
                 log.info("点击登录按钮")
-                await asyncio.sleep(8)  # 等待 ozonid 页面加载 + antibot JS 通过
+                post_click_state = await self._wait_for_login_ready("点击登录后", timeout=60)
+                log.info("点击登录后状态: %s | URL: %s", post_click_state, self._page.url)
+                if post_click_state == "authenticated":
+                    return True
+                if post_click_state == "timeout":
+                    log.warning("seller 点击登录后仍卡在过渡页，URL: %s", self._page.url)
+                    return False
             log.info("点击登录后 URL: %s", self._page.url)
 
             if await self._handle_existing_authenticated_flow():
                 log.info("检测到已认证流程，无需重新收验证码")
             else:
+                pre_sso_state = await self._wait_for_login_ready("进入邮箱登录前", timeout=60)
+                log.info("邮箱登录前状态: %s | URL: %s", pre_sso_state, self._page.url)
+                if pre_sso_state == "authenticated":
+                    return True
+                if pre_sso_state == "timeout":
+                    log.warning("seller 邮箱登录入口在等待 anti-bot 跳转后仍未出现，URL: %s", self._page.url)
+                    return False
                 # 等待 SSO 页面完全渲染（等「Войти по почте」出现）
                 for sel in ['button:has-text("по почте")', 'button:has-text("邮箱")', 'input[type="tel"]']:
                     try:
@@ -295,7 +432,13 @@ class SellerSession:
                         break
                     await asyncio.sleep(2)
 
-                await asyncio.sleep(3)
+                post_email_mode_state = await self._wait_for_login_ready("点击邮箱登录后", timeout=60)
+                log.info("点击邮箱登录后状态: %s | URL: %s", post_email_mode_state, self._page.url)
+                if post_email_mode_state == "authenticated":
+                    return True
+                if post_email_mode_state == "timeout":
+                    log.warning("seller 点击邮箱登录后页面仍未就绪，URL: %s", self._page.url)
+                    return False
                 log.info("当前 URL: %s", self._page.url)
 
                 # 填邮箱
@@ -307,7 +450,9 @@ class SellerSession:
                         log.error("未找到邮箱输入框，URL: %s", self._page.url)
                         return False
                 else:
-                    await email_input.fill(self.email)
+                    if not await self._fill_email_input(self.email):
+                        log.error("邮箱输入框存在，但填充失败，URL: %s", self._page.url)
+                        return False
                     log.info("邮箱已输入: %s", self.email)
                     await asyncio.sleep(1)
 
@@ -335,14 +480,16 @@ class SellerSession:
                     else:
                         await self._page.keyboard.press("Enter")
                     log.info("发送验证码请求")
-                    await asyncio.sleep(5)  # 等待 ozon 发送邮件
+                    await asyncio.sleep(3)
 
-                    # 等待验证码（只取ID > last_id 的新邮件）
+                    # 等待验证码（只取 ID > last_id 的新邮件）
+                    # OZON 当前留给输入验证码的时间较短，这里只做 3 轮轮询，
+                    # 每轮间隔 5 秒，尽量给后面的填码和跳转留足时间。
                     log.info("等待验证码邮件...")
                     with email_svc:
                         email_svc.connect_imap()
-                        deadline = time.time() + 60
-                        while time.time() < deadline:
+                        for attempt in range(3):
+                            log.info("检查验证码邮件，第 %d/3 轮", attempt + 1)
                             for folder in list(folder_last_ids):
                                 try:
                                     all_ids = email_svc.list_email_ids(folder)
@@ -351,7 +498,7 @@ class SellerSession:
                                         mail = email_svc.fetch_email_by_id(folder, eid)
                                         if not mail or not email_svc.is_ozon_verification_email(mail["from"], mail["subject"]):
                                             continue
-                                        if not email_svc.is_email_within_seconds(mail["date"], 60):
+                                        if not email_svc.is_email_within_seconds(mail["date"], 30):
                                             continue
                                         c = email_svc._extract_ozon_code(mail["body"], mail["subject"])
                                         if c:
@@ -366,7 +513,8 @@ class SellerSession:
                                     log.warning("检查文件夹 %s 失败: %s", folder, e)
                             if code:
                                 break
-                            time.sleep(3)
+                            if attempt < 2:
+                                await asyncio.sleep(5)
 
                     if not code:
                         log.error("未收到验证码")

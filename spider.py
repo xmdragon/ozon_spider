@@ -51,13 +51,24 @@ async def wait_stable(page, max_wait=STABLE_MAX_WAIT, interval=STABLE_POLL_INTER
 
 
 async def setup_page(context):
-    """Create a new page and attach observers.
+    """Prepare a page and attach observers.
 
     Do not override navigation-only headers here. Playwright applies these
     headers to all requests from the page, including cross-origin static
     assets, which breaks Ozon's CORS flow for ozonstatic resources.
     """
-    page = await context.new_page()
+    existing_pages = [p for p in context.pages if not p.is_closed()]
+    blank_pages = [p for p in existing_pages if p.url in ("", "about:blank")]
+
+    if blank_pages:
+        page = blank_pages[0]
+        for extra in blank_pages[1:]:
+            try:
+                await extra.close()
+            except Exception:
+                pass
+    else:
+        page = await context.new_page()
     attach_page_observers(page)
     return page
 
