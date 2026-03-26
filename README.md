@@ -83,12 +83,22 @@ curl http://127.0.0.1:8765/health
 
 - `CHROME_BIN`
   Chrome 可执行文件路径
-- `XVFB_DISPLAY`
-  虚拟显示器，默认 `:99`
+- `BROWSER_DISPLAY`
+  浏览器显示器配置。`xvfb:99` 表示启动虚拟显示器 `:99`，`:0` 表示直接使用真实显示器
 - `account.json`
   seller 账号列表，支持两种格式：
   - 顶层数组
   - `{"seller_accounts": [...]}`
+  推荐使用带状态字段的结构，服务会回写：
+  - `state_file`
+  - `profile_dir`
+  - `status`
+  - `last_state_ok_at`
+  - `last_login_ok_at`
+  - `last_login_error`
+  - `cooldown_until`
+  - `login_in_progress`
+  - `last_login_started_at`
 
 示例：
 
@@ -110,6 +120,14 @@ curl http://127.0.0.1:8765/health
 ```
 
 跟踪仓库用 [account.example.json](/home/grom/ozon_spider/account.example.json) 作为模板；本地实际 `account.json` 已加入忽略，不会进版本库。
+
+seller 账号策略：
+
+- 启动时优先验证现有 `seller_state_xxx.json`
+- 按最近可用时间排序选择 active
+- 其它账号在后台用各自独立的 `profile_dir + state_file` 静默恢复
+- 受验证码限制的账号会写入 `cooldown_until`
+- 后台每 5 分钟扫描一次，到期后自动尝试恢复为 standby
 
 ## 邮箱验证码
 

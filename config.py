@@ -9,11 +9,39 @@ if _env.exists():
             _k, _v = _line.split("=", 1)
             os.environ.setdefault(_k.strip(), _v.strip())
 
-_account_file = Path(__file__).parent / "account.json"
+ACCOUNT_JSON_PATH = Path(__file__).parent / "account.json"
 
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/google-chrome-stable")
 CDP_PORT = int(os.getenv("CDP_PORT", "9223"))
-XVFB_DISPLAY = os.getenv("XVFB_DISPLAY", ":99")
+
+
+def _normalize_display_name(value: str) -> str:
+    raw = str(value).strip()
+    if not raw:
+        return ":99"
+    if raw.startswith(":") or ":" in raw:
+        return raw
+    if raw.isdigit():
+        return f":{raw}"
+    return raw
+
+
+def _load_browser_display() -> tuple[str, bool]:
+    raw = str(os.getenv("BROWSER_DISPLAY", "")).strip()
+    legacy = str(os.getenv("XVFB_DISPLAY", "")).strip()
+    value = raw or (f"xvfb:{legacy}" if legacy else "xvfb:99")
+    if value.lower().startswith("xvfb:"):
+        return _normalize_display_name(value.split(":", 1)[1]), True
+    return _normalize_display_name(value), False
+
+
+BROWSER_DISPLAY, BROWSER_USE_XVFB = _load_browser_display()
+XVFB_DISPLAY = BROWSER_DISPLAY  # Backwards-compatible alias for existing imports.
+
+
+def apply_browser_display_env() -> str:
+    os.environ["DISPLAY"] = BROWSER_DISPLAY
+    return BROWSER_DISPLAY
 
 # Timeouts (seconds)
 PAGE_LOAD_TIMEOUT = 30
@@ -26,11 +54,11 @@ OUTPUT_FILE = "results.json"
 
 # Seller accounts: list of {email, app_password, client_id}
 def _load_seller_accounts():
-    if not _account_file.exists():
+    if not ACCOUNT_JSON_PATH.exists():
         return []
 
     try:
-        payload = json.loads(_account_file.read_text(encoding="utf-8"))
+        payload = json.loads(ACCOUNT_JSON_PATH.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"[config] failed to read account.json: {e}")
         return []
@@ -51,11 +79,11 @@ def _load_seller_accounts():
         app_password = str(item.get("app_password", "")).strip()
         client_id = str(item.get("client_id", "")).strip()
         if email and app_password and client_id:
-            accounts.append({
-                "email": email,
-                "app_password": app_password,
-                "client_id": client_id,
-            })
+            normalized = dict(item)
+            normalized["email"] = email
+            normalized["app_password"] = app_password
+            normalized["client_id"] = client_id
+            accounts.append(normalized)
     return accounts
 
 SELLER_ACCOUNTS = _load_seller_accounts()

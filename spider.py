@@ -73,8 +73,9 @@ async def setup_page(context):
     return page
 
 
-async def handle_challenge(page, label="", max_attempts=2) -> str:
+async def handle_challenge(page, label="", max_attempts=6) -> str:
     """Handle challenge/slider on current page. Return final state."""
+    clean_url = page.url.split("?", 1)[0] if "/product/" in page.url else page.url
     for attempt in range(max_attempts):
         state = await classify_page(page)
         log.info(f"{label} challenge loop attempt {attempt+1}: {state}")
@@ -82,7 +83,41 @@ async def handle_challenge(page, label="", max_attempts=2) -> str:
             return state
         if state == STATE_SLIDER:
             solved = await solve_slider(page)
-            if not solved:
+            if solved:
+                retried_clean_url = False
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    state = await classify_page(page)
+                    log.info(f"{label} post-slider state: {state} | url: {page.url[:120]}")
+                    if state == STATE_PRODUCT:
+                        return state
+                    if state == "home":
+                        return state
+                    if state == STATE_ADULT:
+                        return state
+                    # After a successful drag, challenge pages often transition through
+                    # temporary abt/rr states; do not treat them as terminal too early.
+                    if state in (STATE_CHALLENGE, "unknown", STATE_BLOCKED):
+                        if (
+                            not retried_clean_url
+                            and clean_url
+                            and page.url != clean_url
+                            and "/product/" in clean_url
+                        ):
+                            retried_clean_url = True
+                            log.info("%s slider solved but page still transitional; retry clean product URL: %s", label, clean_url)
+                            try:
+                                await page.goto(clean_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT * 1000, referer=HOME_URL)
+                            except Exception as e:
+                                log.info("%s clean URL retry failed: %s", label, e)
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=500)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+                        continue
+                    break
+            else:
                 await human_delay(2, 4)
         elif state in (STATE_CHALLENGE, STATE_BLOCKED, "unknown"):
             # antibot/403 pages may be transient and can auto-resolve back to product
@@ -324,7 +359,7 @@ async def fetch_product(page, sku: str) -> tuple[dict | None, str]:
         state = await handle_adult_prompt(page, sku, label=f"[product {sku}]")
 
     if state in (STATE_SLIDER, STATE_CHALLENGE, STATE_BLOCKED):
-        state = await handle_challenge(page, label=f"[product {sku}]", max_attempts=1)
+        state = await handle_challenge(page, label=f"[product {sku}]", max_attempts=6)
 
     if state == STATE_ADULT:
         state = await handle_adult_prompt(page, sku, label=f"[product {sku}]")

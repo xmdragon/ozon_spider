@@ -8,13 +8,14 @@ Ozon Seller 登录模块。
 import asyncio
 import json
 import logging
-import os
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 
 from chrome_launcher import start_chrome, kill
-from config import CHROME_BIN, XVFB_DISPLAY
+from config import ACCOUNT_JSON_PATH, CHROME_BIN, BROWSER_DISPLAY, apply_browser_display_env
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +26,50 @@ SELLER_LOGIN_READY_TIMEOUT = 60
 SELLER_LOGIN_POLL_INTERVAL = 0.25
 SELLER_LOGIN_CHALLENGE_POLL_INTERVAL = 0.5
 SELLER_LOGIN_LOADSTATE_TIMEOUT_MS = 500
+SELLER_VERIFICATION_INITIAL_WAIT_SECONDS = 5
+SELLER_VERIFICATION_POLL_ATTEMPTS = 8
+SELLER_VERIFICATION_POLL_INTERVAL_SECONDS = 5
+SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 300
+SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS = 300
+SELLER_LOGIN_PROGRESS_STALE_SECONDS = 900
+
+
+def _now_local() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _iso_now() -> str:
+    return _now_local().isoformat(timespec="seconds")
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).astimezone()
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone()
+        except Exception:
+            return None
+    return None
+
+
+def _dt_to_iso(value: Optional[datetime]) -> Optional[str]:
+    if not value:
+        return None
+    return value.astimezone().isoformat(timespec="seconds")
+
+
+def _ensure_retry_cooldown(
+    explicit_until: Optional[datetime],
+    started_at: Optional[datetime] = None,
+) -> datetime:
+    baseline = started_at or _now_local()
+    minimum_until = baseline + timedelta(seconds=SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS)
+    if explicit_until and explicit_until > minimum_until:
+        return explicit_until
+    return minimum_until
 
 
 class SellerSessionUnavailable(RuntimeError):
@@ -40,12 +85,16 @@ class SellerSession:
 
     def __init__(self, email: str, app_password: str, client_id: str,
                  storage_state_file: str = "seller_state.json",
-                 cdp_port: int = SELLER_CDP_PORT):
+                 cdp_port: int = SELLER_CDP_PORT,
+                 profile_dir: Optional[str] = None):
         self.email = email
         self.app_password = app_password
         self.client_id = client_id
         self.storage_state_file = Path(storage_state_file)
         self.cdp_port = cdp_port
+        self.profile_dir = Path(profile_dir) if profile_dir else Path("seller_profile_" + self.email.split("@")[0])
+        self.login_failure_reason: Optional[str] = None
+        self.cooldown_until: Optional[datetime] = None
         self._chrome_proc = None
         self._playwright = None
         self._browser = None
@@ -133,6 +182,22 @@ class SellerSession:
             await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
         return "timeout"
 
+    async def _parse_verification_cooldown(self) -> Optional[datetime]:
+        body = (await self._read_page_text()).lower()
+        seconds = 0
+
+        minute_match = re.search(r"(\d+)\s*(мин|мину|minute|min)", body)
+        second_match = re.search(r"(\d+)\s*(сек|секунд|second|sec|秒)", body)
+
+        if minute_match:
+            seconds += int(minute_match.group(1)) * 60
+        if second_match:
+            seconds += int(second_match.group(1))
+
+        if not seconds:
+            return None
+        return _now_local() + timedelta(seconds=seconds)
+
     async def _find_email_input(self):
         email_input = await self._page.query_selector(
             'input[type="email"], input[name="email"], '
@@ -146,6 +211,36 @@ class SellerSession:
             t = await inp.get_attribute('type') or 'text'
             if t in ('text', 'email', ''):
                 return inp
+        return None
+
+    async def _has_next_button(self) -> bool:
+        try:
+            return bool(await self._page.evaluate("""
+                () => {
+                    const hasExact = (nodes) => Array.from(nodes).some((el) => {
+                        const t = (el.textContent || '').trim();
+                        return t === '下一步' || t === 'Далее' || t.includes('下一步') || t.includes('Далее');
+                    });
+                    return hasExact(document.querySelectorAll('button'))
+                        || hasExact(document.querySelectorAll('span, div, a'));
+                }
+            """))
+        except Exception:
+            return False
+
+    async def _find_code_input(self):
+        selectors = [
+            'input[autocomplete="one-time-code"]',
+            'input[inputmode="numeric"]',
+            'input[type="text"]',
+        ]
+        for sel in selectors:
+            try:
+                locator = self._page.locator(sel).first
+                if await locator.count() > 0:
+                    return locator
+            except Exception:
+                continue
         return None
 
     async def _fill_email_input(self, email: str) -> bool:
@@ -182,8 +277,67 @@ class SellerSession:
             await asyncio.sleep(0.25)
         return False
 
+    async def _fill_verification_code(self, code: str) -> bool:
+        for _ in range(20):
+            try:
+                locator = await self._find_code_input()
+                if locator:
+                    await locator.fill(code)
+                    return True
+            except Exception:
+                pass
+            try:
+                await self._page.evaluate(
+                    '([val]) => { const el = document.querySelector(\'input[autocomplete="one-time-code"], input[inputmode="numeric"], input[type="text"]\'); '
+                    'if(el){ el.value=val; el.dispatchEvent(new Event("input",{bubbles:true})); el.dispatchEvent(new Event("change",{bubbles:true})); return true; } return false; }',
+                    [code],
+                )
+                return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.25)
+        return False
+
+    async def _wait_after_click_next(self, previous_url: str, timeout: int = 15) -> str:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            url = self._page.url
+            if self._is_authenticated_seller_url(url):
+                return "authenticated"
+            if url != previous_url:
+                return "url_changed"
+            if not await self._has_next_button():
+                return "dom_changed"
+            try:
+                await self._page.wait_for_load_state("domcontentloaded", timeout=SELLER_LOGIN_LOADSTATE_TIMEOUT_MS)
+            except Exception:
+                pass
+            await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
+        return "timeout"
+
+    async def _wait_for_post_code_ready(self, timeout: int = 30) -> str:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            url = self._page.url
+            if self._is_authenticated_seller_url(url):
+                return "authenticated"
+            if await self._has_next_button():
+                return "next"
+            if await self._find_email_input():
+                return "email_input"
+            code_input = await self._find_code_input()
+            if code_input:
+                return "code_input"
+            try:
+                await self._page.wait_for_load_state("domcontentloaded", timeout=SELLER_LOGIN_LOADSTATE_TIMEOUT_MS)
+            except Exception:
+                pass
+            await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
+        return "timeout"
+
     async def _click_next_button(self) -> bool:
         try:
+            previous_url = self._page.url
             content = await self._page.content()
         except Exception as e:
             if self._is_authenticated_seller_url(self._page.url):
@@ -243,7 +397,8 @@ class SellerSession:
             return False
 
         log.info("点击下一步: %s", clicked)
-        await asyncio.sleep(5)
+        result = await self._wait_after_click_next(previous_url)
+        log.info("点击下一步后状态: %s | URL: %s", result, self._page.url)
         return True
 
     async def _handle_existing_authenticated_flow(self) -> bool:
@@ -261,13 +416,12 @@ class SellerSession:
                 if not saw_2fa:
                     saw_2fa = True
                     log.info("检测到 2FA 过渡页，等待其自动跳转")
-                await asyncio.sleep(2)
+                await asyncio.sleep(SELLER_LOGIN_CHALLENGE_POLL_INTERVAL)
                 continue
 
             if await self._click_next_button():
                 if self._is_authenticated_seller_url(self._page.url):
                     return True
-                await asyncio.sleep(2)
                 continue
 
             for sel in [
@@ -284,7 +438,7 @@ class SellerSession:
             if email_input:
                 return False
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
 
         return self._is_authenticated_seller_url(self._page.url)
 
@@ -296,11 +450,10 @@ class SellerSession:
         from playwright.async_api import async_playwright
 
         # 每个账号使用独立的 Chrome profile（按 email 区分）
-        os.environ["DISPLAY"] = XVFB_DISPLAY
-        profile_name = "seller_profile_" + self.email.split("@")[0]
-        seller_profile = Path(profile_name)
+        apply_browser_display_env()
+        seller_profile = self.profile_dir
         seller_profile.mkdir(exist_ok=True)
-        self._chrome_proc = start_chrome(CHROME_BIN, self.cdp_port, XVFB_DISPLAY,
+        self._chrome_proc = start_chrome(CHROME_BIN, self.cdp_port, BROWSER_DISPLAY,
                                          user_data_dir=str(seller_profile.absolute()))
 
         self._playwright = await async_playwright().start()
@@ -363,6 +516,8 @@ class SellerSession:
         from email_service import EmailService
 
         try:
+            self.login_failure_reason = None
+            self.cooldown_until = None
             # 直接访问 seller 登录页（跳过首页 → ozonid 跳转，避免 antibot）
             signin_url = "https://seller.ozon.ru/app/registration/signin?locale=zh-Hans"
             log.info("访问登录页: %s", signin_url)
@@ -378,6 +533,7 @@ class SellerSession:
             if ready_state == "authenticated":
                 return True
             if ready_state == "timeout":
+                self.login_failure_reason = "signin_not_ready_timeout"
                 log.warning("seller 登录页在等待 anti-bot 跳转后仍未就绪，URL: %s", self._page.url)
                 return False
 
@@ -391,6 +547,7 @@ class SellerSession:
                 if post_click_state == "authenticated":
                     return True
                 if post_click_state == "timeout":
+                    self.login_failure_reason = "post_signin_not_ready_timeout"
                     log.warning("seller 点击登录后仍卡在过渡页，URL: %s", self._page.url)
                     return False
             log.info("点击登录后 URL: %s", self._page.url)
@@ -403,6 +560,7 @@ class SellerSession:
                 if pre_sso_state == "authenticated":
                     return True
                 if pre_sso_state == "timeout":
+                    self.login_failure_reason = "email_entry_not_ready_timeout"
                     log.warning("seller 邮箱登录入口在等待 anti-bot 跳转后仍未出现，URL: %s", self._page.url)
                     return False
                 # 等待 SSO 页面完全渲染（等「Войти по почте」出现）
@@ -430,13 +588,14 @@ class SellerSession:
                             break
                     if clicked:
                         break
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
 
                 post_email_mode_state = await self._wait_for_login_ready("点击邮箱登录后", timeout=60)
                 log.info("点击邮箱登录后状态: %s | URL: %s", post_email_mode_state, self._page.url)
                 if post_email_mode_state == "authenticated":
                     return True
                 if post_email_mode_state == "timeout":
+                    self.login_failure_reason = "post_email_mode_not_ready_timeout"
                     log.warning("seller 点击邮箱登录后页面仍未就绪，URL: %s", self._page.url)
                     return False
                 log.info("当前 URL: %s", self._page.url)
@@ -447,15 +606,15 @@ class SellerSession:
                     if await self._handle_existing_authenticated_flow():
                         log.info("回落 signin 后通过下一步进入已认证流程")
                     else:
+                        self.login_failure_reason = "email_input_missing"
                         log.error("未找到邮箱输入框，URL: %s", self._page.url)
                         return False
                 else:
                     if not await self._fill_email_input(self.email):
+                        self.login_failure_reason = "email_input_fill_failed"
                         log.error("邮箱输入框存在，但填充失败，URL: %s", self._page.url)
                         return False
                     log.info("邮箱已输入: %s", self.email)
-                    await asyncio.sleep(1)
-
                     # 记录发送前最新邮件ID（必须在点击发送前记录）
                     email_svc = EmailService(self.email, self.app_password)
                     code = None
@@ -479,21 +638,38 @@ class SellerSession:
                         await send_btn.click()
                     else:
                         await self._page.keyboard.press("Enter")
-                    log.info("发送验证码请求")
-                    await asyncio.sleep(3)
+                    send_requested_at = _iso_now()
+                    send_requested_monotonic = time.monotonic()
+                    log.info("发送验证码请求: email=%s at=%s", self.email, send_requested_at)
+                    await asyncio.sleep(SELLER_VERIFICATION_INITIAL_WAIT_SECONDS)
+                    log.info(
+                        "发送验证码请求后等待 %.1fs，开始首次拉取邮件",
+                        time.monotonic() - send_requested_monotonic,
+                    )
 
                     # 等待验证码（只取 ID > last_id 的新邮件）
-                    # OZON 当前留给输入验证码的时间较短，这里只做 3 轮轮询，
-                    # 每轮间隔 5 秒，尽量给后面的填码和跳转留足时间。
+                    # 邮件投递可能明显晚于页面发码动作，这里保守拉长观察窗口。
                     log.info("等待验证码邮件...")
                     with email_svc:
                         email_svc.connect_imap()
-                        for attempt in range(3):
-                            log.info("检查验证码邮件，第 %d/3 轮", attempt + 1)
+                        for attempt in range(SELLER_VERIFICATION_POLL_ATTEMPTS):
+                            log.info(
+                                "检查验证码邮件，第 %d/%d 轮（距发送 %.1fs）",
+                                attempt + 1,
+                                SELLER_VERIFICATION_POLL_ATTEMPTS,
+                                time.monotonic() - send_requested_monotonic,
+                            )
                             for folder in list(folder_last_ids):
                                 try:
                                     all_ids = email_svc.list_email_ids(folder)
                                     new_ids = [x for x in all_ids if x > folder_last_ids.get(folder, 0)]
+                                    log.info(
+                                        "检查文件夹 %s: baseline_id=%d latest_id=%d new_count=%d",
+                                        folder,
+                                        folder_last_ids.get(folder, 0),
+                                        all_ids[-1] if all_ids else 0,
+                                        len(new_ids),
+                                    )
                                     for eid in reversed(new_ids):
                                         mail = email_svc.fetch_email_by_id(folder, eid)
                                         if not mail or not email_svc.is_ozon_verification_email(mail["from"], mail["subject"]):
@@ -513,38 +689,38 @@ class SellerSession:
                                     log.warning("检查文件夹 %s 失败: %s", folder, e)
                             if code:
                                 break
-                            if attempt < 2:
-                                await asyncio.sleep(5)
+                            if attempt < SELLER_VERIFICATION_POLL_ATTEMPTS - 1:
+                                await asyncio.sleep(SELLER_VERIFICATION_POLL_INTERVAL_SECONDS)
 
                     if not code:
+                        self.login_failure_reason = "verification_code_timeout"
+                        self.cooldown_until = await self._parse_verification_cooldown() or (_now_local() + timedelta(minutes=30))
                         log.error("未收到验证码")
                         return False
                     log.info("收到验证码")
 
                     # 填入验证码（重新查询避免旧句柄过期）
-                    await asyncio.sleep(2)
-                    await self._page.evaluate(
-                        '([sel, val]) => { const el = document.querySelector(sel); '
-                        'if(el){ el.value=val; el.dispatchEvent(new Event("input",{bubbles:true})); el.dispatchEvent(new Event("change",{bubbles:true})); } }',
-                        ['input[type="text"]', code]
-                    )
+                    if not await self._fill_verification_code(code):
+                        self.login_failure_reason = "verification_code_fill_failed"
+                        log.error("验证码输入框存在，但填充失败，URL: %s", self._page.url)
+                        return False
                     log.info("验证码已填入")
 
-                    # 等待页面导航完成
-                    try:
-                        await self._page.wait_for_load_state("domcontentloaded", timeout=10000)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(2)
-                    log.info("验证码后 URL: %s", self._page.url)
+                    post_code_state = await self._wait_for_post_code_ready(timeout=30)
+                    log.info("验证码后状态: %s | URL: %s", post_code_state, self._page.url)
 
                     # 检测并点击「下一步」
-                    for _ in range(10):
-                        if await self._click_next_button():
-                            break
-                        if self._is_authenticated_seller_url(self._page.url):
-                            break
-                        await asyncio.sleep(2)
+                    if post_code_state != "authenticated":
+                        for _ in range(10):
+                            if await self._click_next_button():
+                                break
+                            if self._is_authenticated_seller_url(self._page.url):
+                                break
+                            await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
+
+                    if not self._is_authenticated_seller_url(self._page.url):
+                        if await self._handle_existing_authenticated_flow():
+                            log.info("验证码后通过认证过渡流程进入 seller")
 
             log.info("下一步后 URL: %s", self._page.url)
 
@@ -554,13 +730,15 @@ class SellerSession:
                 if btn:
                     await btn.evaluate('el => el.click()')
                     log.info("再次点击登录按钮")
-                    await asyncio.sleep(8)
+                    post_click_state = await self._wait_for_login_ready("再次点击登录后", timeout=30)
+                    log.info("再次点击登录后状态: %s | URL: %s", post_click_state, self._page.url)
 
             log.info("最终 URL: %s", self._page.url)
 
             # 验证：不在认证页即为成功
             final_url = self._page.url
             if any(k in final_url for k in ("signin", "ozonid", "sso", "registration")):
+                self.login_failure_reason = "still_on_auth_page"
                 log.warning("登录后仍在认证页，登录失败，URL: %s", final_url)
                 return False
 
@@ -573,6 +751,7 @@ class SellerSession:
             return True
 
         except Exception as e:
+            self.login_failure_reason = f"exception:{type(e).__name__}"
             log.error("登录异常: %s", e, exc_info=True)
             return False
 
@@ -738,11 +917,19 @@ async def get_seller_session(
     storage_state_file: str = "seller_state.json",
     allow_login: bool = True,
     cdp_port: int = SELLER_CDP_PORT,
+    profile_dir: Optional[str] = None,
 ) -> Optional[SellerSession]:
     """
     创建并启动 SellerSession。返回就绪的 session，失败返回 None。
     """
-    session = SellerSession(email, app_password, client_id, storage_state_file, cdp_port=cdp_port)
+    session = SellerSession(
+        email,
+        app_password,
+        client_id,
+        storage_state_file,
+        cdp_port=cdp_port,
+        profile_dir=profile_dir,
+    )
     ok = await session.start(allow_login=allow_login)
     if ok:
         return session
@@ -754,77 +941,90 @@ def _account_storage_state(email: str) -> str:
     return f"seller_state_{email.split('@')[0]}.json"
 
 
+def _account_profile_dir(email: str) -> str:
+    return f"seller_profile_{email.split('@')[0]}"
+
+
 def _account_cdp_port(index: int) -> int:
     return SELLER_CDP_PORT + index
 
 
-async def get_seller_session_with_fallback(accounts: list) -> Optional[SellerSession]:
-    """
-    尝试多个账号，返回第一个成功的 SellerSession。
-    accounts: [{email, app_password, client_id}, ...]
-    每个账号使用独立的 storage_state 文件（seller_state_{email}.json）。
-    """
-    # 第一阶段：优先尝试恢复现有 cookies，不触发重新登录
-    for idx, acct in enumerate(accounts):
-        email = acct["email"]
-        storage = _account_storage_state(email)
-        if not Path(storage).exists():
-            continue
-        log.info("优先尝试恢复账号 cookies: %s (%s)", email, storage)
-        session = await get_seller_session(
-            email,
-            acct["app_password"],
-            acct["client_id"],
-            storage,
-            allow_login=False,
-            cdp_port=_account_cdp_port(idx),
-        )
-        if session:
-            log.info("✓ 使用已有 cookies 恢复账号成功: %s", email)
-            return session
-        log.warning("账号 %s 的已有 cookies 不可用，继续尝试其他 cookies", email)
+def _normalize_account(acct: dict, index: int) -> dict:
+    email = str(acct["email"]).strip()
+    normalized = dict(acct)
+    normalized["email"] = email
+    normalized["app_password"] = str(acct["app_password"]).strip()
+    normalized["client_id"] = str(acct["client_id"]).strip()
+    normalized["state_file"] = str(acct.get("state_file") or _account_storage_state(email))
+    normalized["profile_dir"] = str(acct.get("profile_dir") or _account_profile_dir(email))
+    normalized["cdp_port"] = int(acct.get("cdp_port") or _account_cdp_port(index))
+    normalized["status"] = str(acct.get("status") or "unknown")
+    normalized["last_state_ok_at"] = acct.get("last_state_ok_at")
+    normalized["last_login_ok_at"] = acct.get("last_login_ok_at")
+    normalized["last_login_error"] = str(acct.get("last_login_error") or "")
+    normalized["cooldown_until"] = acct.get("cooldown_until")
+    normalized["login_in_progress"] = bool(acct.get("login_in_progress", False))
+    normalized["last_login_started_at"] = acct.get("last_login_started_at")
+    return normalized
 
-    # 第二阶段：所有已有 cookies 都不可用时，才按配置顺序登录
-    for idx, acct in enumerate(accounts):
-        email = acct["email"]
-        storage = _account_storage_state(email)
-        log.info("尝试账号: %s", email)
-        session = await get_seller_session(
-            email,
-            acct["app_password"],
-            acct["client_id"],
-            storage,
-            cdp_port=_account_cdp_port(idx),
-        )
-        if session:
-            log.info("✓ 账号 %s 登录成功", email)
-            return session
-        log.warning("账号 %s 登录失败，尝试下一个", email)
-    log.error("所有账号登录均失败")
-    return None
+
+def _serialize_account(acct: dict) -> dict:
+    return {
+        "email": acct["email"],
+        "app_password": acct["app_password"],
+        "client_id": acct["client_id"],
+        "state_file": acct["state_file"],
+        "profile_dir": acct["profile_dir"],
+        "status": acct.get("status") or "unknown",
+        "last_state_ok_at": acct.get("last_state_ok_at"),
+        "last_login_ok_at": acct.get("last_login_ok_at"),
+        "last_login_error": acct.get("last_login_error") or "",
+        "cooldown_until": acct.get("cooldown_until"),
+        "login_in_progress": bool(acct.get("login_in_progress", False)),
+        "last_login_started_at": acct.get("last_login_started_at"),
+    }
+
+
+def _account_state_score(acct: dict) -> float:
+    state_path = Path(acct["state_file"])
+    candidates = []
+    if state_path.exists():
+        try:
+            candidates.append(state_path.stat().st_mtime)
+        except Exception:
+            pass
+    for key in ("last_state_ok_at", "last_login_ok_at"):
+        dt = _parse_time(acct.get(key))
+        if dt:
+            candidates.append(dt.timestamp())
+    return max(candidates) if candidates else 0.0
+
+
+def _cooldown_active(acct: dict) -> bool:
+    dt = _parse_time(acct.get("cooldown_until"))
+    return bool(dt and dt > _now_local())
 
 
 class SellerSessionManager:
     """Manage active/standby seller sessions with background recovery."""
 
     def __init__(self, accounts: list):
-        self._accounts = [
-            {
-                **acct,
-                "storage_state_file": _account_storage_state(acct["email"]),
-                "cdp_port": _account_cdp_port(idx),
-            }
-            for idx, acct in enumerate(accounts)
-        ]
+        self._account_file = ACCOUNT_JSON_PATH
+        self._accounts = [_normalize_account(acct, idx) for idx, acct in enumerate(accounts)]
+        self._boot_time = _now_local()
         self.active_session: Optional[SellerSession] = None
         self.standby_session: Optional[SellerSession] = None
         self._lock = asyncio.Lock()
         self._recovery_task: Optional[asyncio.Task] = None
+        self._recovery_wakeup = asyncio.Event()
         self._stopped = False
         self._last_failure: Optional[Dict[str, Any]] = None
         self._last_recovery_error: Optional[str] = None
 
     async def start(self):
+        async with self._lock:
+            self._sanitize_accounts_locked()
+            self._persist_accounts_locked()
         self._schedule_recovery()
 
     async def close(self):
@@ -837,6 +1037,21 @@ class SellerSessionManager:
                 pass
 
         async with self._lock:
+            now = _now_local()
+            for acct in self._accounts:
+                if acct.get("login_in_progress"):
+                    started_at = _parse_time(acct.get("last_login_started_at")) or now
+                    acct["status"] = "cooldown"
+                    acct["last_login_error"] = acct.get("last_login_error") or "login_interrupted"
+                    acct["cooldown_until"] = _dt_to_iso(
+                        _ensure_retry_cooldown(
+                            _parse_time(acct.get("cooldown_until")),
+                            started_at=started_at,
+                        )
+                    )
+                    acct["login_in_progress"] = False
+                    acct["last_login_started_at"] = None
+            self._persist_accounts_locked()
             sessions = [self.active_session, self.standby_session]
             self.active_session = None
             self.standby_session = None
@@ -847,69 +1062,72 @@ class SellerSessionManager:
     def _schedule_recovery(self):
         if self._stopped:
             return
-        if self._recovery_task and not self._recovery_task.done():
-            return
-        self._recovery_task = asyncio.create_task(self._recovery_loop())
+        if not self._recovery_task or self._recovery_task.done():
+            self._recovery_task = asyncio.create_task(self._recovery_loop())
+        self._recovery_wakeup.set()
 
     async def _recovery_loop(self):
-        try:
-            await self.ensure_pool()
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self._last_recovery_error = str(e)
-            log.error("seller recovery loop error: %s", e)
+        while not self._stopped:
+            try:
+                await self.ensure_pool()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._last_recovery_error = str(e)
+                log.error("seller recovery loop error: %s", e)
+
+            if self._stopped:
+                return
+
+            self._recovery_wakeup.clear()
+            try:
+                await asyncio.wait_for(
+                    self._recovery_wakeup.wait(),
+                    timeout=SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
 
     async def ensure_pool(self):
         target_count = min(2, len(self._accounts))
         async with self._lock:
             if self._stopped:
                 return
+            self._sanitize_accounts_locked()
             await self._drop_dead_sessions_locked()
-            if self._session_count_locked() >= target_count:
-                return
+            self._persist_accounts_locked()
 
-        # phase 1: restore existing cookies only
-        for acct in self._accounts:
-            if self._stopped:
-                return
-            if not Path(acct["storage_state_file"]).exists():
-                continue
-            if await self._has_session_email(acct["email"]):
-                continue
-            log.info("后台恢复 seller cookies: %s", acct["email"])
-            session = await get_seller_session(
-                acct["email"],
-                acct["app_password"],
-                acct["client_id"],
-                acct["storage_state_file"],
-                allow_login=False,
-                cdp_port=acct["cdp_port"],
-            )
-            if session:
-                await self._add_session(session)
-                if await self._is_pool_full(target_count):
+        while not self._stopped:
+            async with self._lock:
+                if self._session_count_locked() >= target_count:
                     return
+                restore_candidates = self._restore_candidates_locked()
+            progressed = False
+            for acct in restore_candidates:
+                if await self._has_session_email(acct["email"]):
+                    continue
+                session = await self._attempt_restore(acct)
+                if session:
+                    await self._add_session(session)
+                    progressed = True
+                    break
+            if progressed:
+                continue
 
-        # phase 2: login only in background
-        for acct in self._accounts:
-            if self._stopped:
-                return
-            if await self._has_session_email(acct["email"]):
-                continue
-            log.info("后台登录 seller 账号: %s", acct["email"])
-            session = await get_seller_session(
-                acct["email"],
-                acct["app_password"],
-                acct["client_id"],
-                acct["storage_state_file"],
-                allow_login=True,
-                cdp_port=acct["cdp_port"],
-            )
-            if session:
-                await self._add_session(session)
-                if await self._is_pool_full(target_count):
+            async with self._lock:
+                if self._session_count_locked() >= target_count:
                     return
+                login_candidates = self._login_candidates_locked()
+            for acct in login_candidates:
+                if await self._has_session_email(acct["email"]):
+                    continue
+                session = await self._attempt_login(acct)
+                if session:
+                    await self._add_session(session)
+                    progressed = True
+                    break
+            if not progressed:
+                return
 
     async def call_with_failover(self, method_name: str, *args, **kwargs):
         async with self._lock:
@@ -942,6 +1160,7 @@ class SellerSessionManager:
 
     async def health_snapshot(self) -> Dict[str, Any]:
         async with self._lock:
+            self._sanitize_accounts_locked()
             await self._drop_dead_sessions_locked()
             return {
                 "ready": self.active_session is not None,
@@ -952,6 +1171,20 @@ class SellerSessionManager:
                 "recovery_running": bool(self._recovery_task and not self._recovery_task.done()),
                 "last_failure": self._last_failure,
                 "last_recovery_error": self._last_recovery_error,
+                "accounts": [
+                    {
+                        "email": acct["email"],
+                        "status": acct.get("status"),
+                        "state_file": acct["state_file"],
+                        "profile_dir": acct["profile_dir"],
+                        "last_state_ok_at": acct.get("last_state_ok_at"),
+                        "last_login_ok_at": acct.get("last_login_ok_at"),
+                        "last_login_error": acct.get("last_login_error"),
+                        "cooldown_until": acct.get("cooldown_until"),
+                        "login_in_progress": acct.get("login_in_progress", False),
+                    }
+                    for acct in self._accounts
+                ],
             }
 
     async def _add_session(self, session: SellerSession):
@@ -959,13 +1192,24 @@ class SellerSessionManager:
             if self._stopped:
                 await session.close()
                 return
+            acct = self._account_locked(session.email)
+            if acct:
+                acct["status"] = "ready"
+                acct["last_state_ok_at"] = _iso_now()
+                acct["last_login_ok_at"] = acct.get("last_login_ok_at") or _iso_now()
+                acct["last_login_error"] = ""
+                acct["cooldown_until"] = None
+                acct["login_in_progress"] = False
+                acct["last_login_started_at"] = None
             if self.active_session and self.active_session.email == session.email:
                 await self.active_session.close()
                 self.active_session = session
+                self._persist_accounts_locked()
                 return
             if self.standby_session and self.standby_session.email == session.email:
                 await self.standby_session.close()
                 self.standby_session = session
+                self._persist_accounts_locked()
                 return
             if self.active_session is None:
                 self.active_session = session
@@ -975,6 +1219,7 @@ class SellerSessionManager:
                 log.info("seller standby session = %s", session.email)
             else:
                 await session.close()
+            self._persist_accounts_locked()
 
     async def _has_session_email(self, email: str) -> bool:
         async with self._lock:
@@ -998,6 +1243,10 @@ class SellerSessionManager:
             if session.is_shallow_ready():
                 continue
             setattr(self, role, None)
+            acct = self._account_locked(session.email)
+            if acct:
+                acct["status"] = "stale"
+                acct["last_login_error"] = "session_dead"
             self._last_failure = {
                 "email": session.email,
                 "reason": "shallow_check_failed",
@@ -1009,12 +1258,17 @@ class SellerSessionManager:
             self.active_session = self.standby_session
             self.standby_session = None
             log.info("seller failover: standby promoted to active = %s", self.active_session.email)
+        self._persist_accounts_locked()
 
     async def _retire_active_locked(self, reason: str):
         failed = self.active_session
         if not failed:
             return
         self.active_session = None
+        acct = self._account_locked(failed.email)
+        if acct:
+            acct["status"] = "failed"
+            acct["last_login_error"] = reason
         self._last_failure = {
             "email": failed.email,
             "reason": reason,
@@ -1022,3 +1276,140 @@ class SellerSessionManager:
         }
         log.warning("seller active session retired: %s (%s)", failed.email, reason)
         await failed.close()
+        self._persist_accounts_locked()
+
+    def _account_locked(self, email: str) -> Optional[dict]:
+        for acct in self._accounts:
+            if acct["email"] == email:
+                return acct
+        return None
+
+    def _sanitize_accounts_locked(self):
+        changed = False
+        now = _now_local()
+        for acct in self._accounts:
+            acct.setdefault("status", "unknown")
+            acct.setdefault("state_file", _account_storage_state(acct["email"]))
+            acct.setdefault("profile_dir", _account_profile_dir(acct["email"]))
+            acct.setdefault("last_state_ok_at", None)
+            acct.setdefault("last_login_ok_at", None)
+            acct.setdefault("last_login_error", "")
+            acct.setdefault("cooldown_until", None)
+            acct.setdefault("login_in_progress", False)
+            acct.setdefault("last_login_started_at", None)
+            started_at = _parse_time(acct.get("last_login_started_at"))
+            if acct.get("login_in_progress"):
+                stale_from_previous_run = not started_at or started_at < self._boot_time
+                stale_by_timeout = started_at and (now - started_at).total_seconds() > SELLER_LOGIN_PROGRESS_STALE_SECONDS
+                if stale_from_previous_run or stale_by_timeout:
+                    acct["status"] = "cooldown"
+                    acct["last_login_error"] = acct.get("last_login_error") or "login_interrupted"
+                    acct["cooldown_until"] = _dt_to_iso(
+                        _ensure_retry_cooldown(
+                            _parse_time(acct.get("cooldown_until")),
+                            started_at=started_at or now,
+                        )
+                    )
+                    acct["login_in_progress"] = False
+                    acct["last_login_started_at"] = None
+                    changed = True
+        if changed:
+            self._persist_accounts_locked()
+
+    def _persist_accounts_locked(self):
+        payload = {"seller_accounts": [_serialize_account(acct) for acct in self._accounts]}
+        self._account_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _restore_candidates_locked(self) -> list[dict]:
+        candidates = []
+        for acct in self._accounts:
+            if Path(acct["state_file"]).exists():
+                candidates.append(acct)
+        return sorted(candidates, key=_account_state_score, reverse=True)
+
+    def _login_candidates_locked(self) -> list[dict]:
+        candidates = []
+        for acct in self._accounts:
+            if acct.get("login_in_progress"):
+                continue
+            if _cooldown_active(acct):
+                continue
+            candidates.append(acct)
+        return sorted(candidates, key=_account_state_score, reverse=True)
+
+    async def _open_session(self, acct: dict, allow_login: bool) -> tuple[Optional[SellerSession], Optional[SellerSession]]:
+        session = SellerSession(
+            acct["email"],
+            acct["app_password"],
+            acct["client_id"],
+            storage_state_file=acct["state_file"],
+            cdp_port=acct["cdp_port"],
+            profile_dir=acct["profile_dir"],
+        )
+        ok = await session.start(allow_login=allow_login)
+        if ok:
+            return session, None
+        return None, session
+
+    async def _attempt_restore(self, acct: dict) -> Optional[SellerSession]:
+        if self._stopped:
+            return None
+        log.info("优先尝试恢复 seller state: %s (%s)", acct["email"], acct["state_file"])
+        session, failed = await self._open_session(acct, allow_login=False)
+        if session:
+            async with self._lock:
+                acct["status"] = "ready"
+                acct["last_state_ok_at"] = _iso_now()
+                acct["last_login_error"] = ""
+                self._persist_accounts_locked()
+            return session
+        async with self._lock:
+            acct["status"] = "stale"
+            if not acct.get("last_login_error"):
+                acct["last_login_error"] = "state_restore_failed"
+            self._persist_accounts_locked()
+        if failed:
+            await failed.close()
+        return None
+
+    async def _attempt_login(self, acct: dict) -> Optional[SellerSession]:
+        if self._stopped:
+            return None
+        async with self._lock:
+            acct["login_in_progress"] = True
+            acct["last_login_started_at"] = _iso_now()
+            acct["status"] = "logging_in"
+            self._persist_accounts_locked()
+
+        log.info("后台静默登录 seller 账号: %s", acct["email"])
+        session, failed = await self._open_session(acct, allow_login=True)
+        if session:
+            async with self._lock:
+                acct["status"] = "ready"
+                acct["last_login_ok_at"] = _iso_now()
+                acct["last_state_ok_at"] = _iso_now()
+                acct["last_login_error"] = ""
+                acct["cooldown_until"] = None
+                acct["login_in_progress"] = False
+                acct["last_login_started_at"] = None
+                self._persist_accounts_locked()
+            return session
+
+        cooldown_dt = _ensure_retry_cooldown(
+            failed.cooldown_until if failed else None,
+            started_at=_parse_time(acct.get("last_login_started_at")),
+        )
+        failure_reason = failed.login_failure_reason if failed and failed.login_failure_reason else "login_failed"
+        async with self._lock:
+            acct["status"] = "cooldown"
+            acct["last_login_error"] = failure_reason
+            acct["cooldown_until"] = _dt_to_iso(cooldown_dt)
+            acct["login_in_progress"] = False
+            acct["last_login_started_at"] = None
+            self._persist_accounts_locked()
+        if failed:
+            await failed.close()
+        return None

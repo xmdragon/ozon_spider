@@ -333,12 +333,6 @@ async def classify_page(page) -> str:
                 return STATE_BLOCKED
             return STATE_CHALLENGE
 
-        # Product pages are the hot path; check them before serializing full HTML.
-        if any(k in url for k in ["/product/", "/products/"]):
-            name_el = await page.query_selector("h1")
-            if name_el:
-                return STATE_PRODUCT
-
         adult_modal = await page.query_selector('[data-widget="userAdultModal"]')
         if adult_modal:
             return STATE_ADULT
@@ -365,7 +359,14 @@ async def classify_page(page) -> str:
 
         # Antibot / challenge wait page (not yet final result)
         # Title-based: only match if title IS the challenge page title
-        if any(k in title_lower for k in ["antibot captcha", "checking", "challenge", "проверка", "подождите"]):
+        if any(k in title_lower for k in [
+            "antibot captcha",
+            "checking",
+            "challenge",
+            "проверка",
+            "подождите",
+            "подтвердите, что вы не бот",
+        ]):
             return STATE_CHALLENGE
 
         # Ozon home/category page — treated as non-product but not blocked
@@ -378,7 +379,18 @@ async def classify_page(page) -> str:
             return STATE_CHALLENGE
         # Ozon-specific antibot challenge page (not just the word in JSON bundles)
         if 'id="captcha-container"' in content or 'id="captcha"' in content:
-            return STATE_CHALLENGE
+            return STATE_SLIDER
+        if (
+            "Подтвердите, что вы не бот" in content
+            or "Передвиньте ползунок, чтобы пазл попал в контур" in content
+        ):
+            return STATE_SLIDER
+
+        # Product pages only after excluding captcha/challenge pages.
+        if any(k in url for k in ["/product/", "/products/"]):
+            name_el = await page.query_selector("h1")
+            if name_el:
+                return STATE_PRODUCT
 
         return STATE_UNKNOWN
     except Exception as e:

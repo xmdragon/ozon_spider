@@ -3,12 +3,30 @@
     {
       "email": "your@qq.com",
       "app_password": "app_password",
-      "client_id": "3465475"
+      "client_id": "3465475",
+      "state_file": "seller_state_your.json",
+      "profile_dir": "seller_profile_your",
+      "status": "unknown",
+      "last_state_ok_at": null,
+      "last_login_ok_at": null,
+      "last_login_error": "",
+      "cooldown_until": null,
+      "login_in_progress": false,
+      "last_login_started_at": null
     },
     {
       "email": "another@163.com",
       "app_password": "app_password2",
-      "client_id": "3092234"
+      "client_id": "3092234",
+      "state_file": "seller_state_another.json",
+      "profile_dir": "seller_profile_another",
+      "status": "unknown",
+      "last_state_ok_at": null,
+      "last_login_ok_at": null,
+      "last_login_error": "",
+      "cooldown_until": null,
+      "login_in_progress": false,
+      "last_login_started_at": null
     }
   ]
 }

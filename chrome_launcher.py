@@ -1,5 +1,5 @@
 """
-Launch system Chrome in --guest mode under Xvfb, return CDP port.
+Launch system Chrome under Xvfb and return CDP port.
 """
 import subprocess
 import time
@@ -46,7 +46,6 @@ def start_chrome(
     cmd = [
         chrome_bin,
         f"--remote-debugging-port={cdp_port}",
-        f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-default-apps",
@@ -68,6 +67,8 @@ def start_chrome(
         "--window-size=1920,1080",
         "about:blank",
     ]
+    if user_data_dir is not None:
+        cmd.insert(2, f"--user-data-dir={user_data_dir}")
     proc = subprocess.Popen(
         cmd,
         env=env,

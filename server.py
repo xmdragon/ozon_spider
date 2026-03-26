@@ -13,7 +13,6 @@ Ozon Spider HTTP 服务。
 """
 import asyncio
 import logging
-import os
 import random
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -22,7 +21,7 @@ from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
 
 from config import (
-    CHROME_BIN, CDP_PORT, XVFB_DISPLAY,
+    CHROME_BIN, CDP_PORT, BROWSER_DISPLAY, BROWSER_USE_XVFB, apply_browser_display_env,
     SELLER_ACCOUNTS,
 )
 from chrome_launcher import kill, start_xvfb
@@ -48,16 +47,82 @@ class AppState:
 state = AppState()
 
 
+async def _fetch_with_profile_recovery(sku: str) -> tuple[dict | None, str]:
+    """
+    Anonymous spider fetch with strict profile hygiene.
+
+    Rule:
+    - final state is product (`status == "ok"`): keep profile/state
+    - any non-`ok` final state: treat profile as polluted, close it, delete it,
+      let the pool create a fresh profile, then retry once
+    """
+    if not state.spider_pool:
+        raise HTTPException(503, "Spider page pool not ready")
+
+    attempts = 2
+    last_status = "unavailable"
+    last_data = None
+    last_error: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        page = await state.spider_pool.acquire()
+        successful = False
+        unhealthy = False
+        reset_pool = False
+        try:
+            data, fetch_status = await page.fetch(sku)
+            last_data = data
+            last_status = fetch_status
+            successful = fetch_status == "ok"
+            unhealthy = not successful
+            reset_pool = unhealthy
+            if successful:
+                return data, fetch_status
+            log.warning(
+                "anonymous fetch attempt %d/%d for SKU %s ended with status=%s; resetting anonymous pool and retrying",
+                attempt,
+                attempts,
+                sku,
+                fetch_status,
+            )
+        except Exception as e:
+            last_error = e
+            unhealthy = True
+            reset_pool = True
+            log.error(
+                "anonymous fetch attempt %d/%d for SKU %s failed: %s; resetting anonymous pool",
+                attempt,
+                attempts,
+                sku,
+                e,
+            )
+            if attempt == attempts:
+                raise HTTPException(500, str(e))
+        finally:
+            await state.spider_pool.release(
+                page,
+                unhealthy=unhealthy,
+                successful=successful,
+                reset_pool=reset_pool,
+            )
+
+    if last_error:
+        raise HTTPException(500, str(last_error))
+    return last_data, last_status
+
+
 # ─── Lifespan ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动 Xvfb
-    os.environ["DISPLAY"] = XVFB_DISPLAY
-    try:
-        state.xvfb_proc = start_xvfb(XVFB_DISPLAY)
-    except Exception as e:
-        log.warning("Xvfb start failed (may already be running): %s", e)
+    apply_browser_display_env()
+    if BROWSER_USE_XVFB:
+        try:
+            state.xvfb_proc = start_xvfb(BROWSER_DISPLAY)
+        except Exception as e:
+            log.warning("Xvfb start failed (may already be running): %s", e)
+    else:
+        log.info("Using native display %s", BROWSER_DISPLAY)
 
     # 初始化 spider worker pool
     try:
@@ -65,7 +130,7 @@ async def lifespan(app: FastAPI):
         state.spider_pool = SpiderWorkerPool(
             state.spider_playwright,
             CHROME_BIN,
-            XVFB_DISPLAY,
+            BROWSER_DISPLAY,
             min_workers=SPIDER_MIN_WORKERS,
             max_workers=SPIDER_MAX_WORKERS,
             idle_ttl_seconds=SPIDER_IDLE_WORKER_TTL_SECONDS,
@@ -140,22 +205,7 @@ async def get_sku(sku: str = Query(..., description="Ozon SKU")):
     """
     抓取商品完整数据，自动补充尺寸重量（如果 seller session 就绪）。
     """
-    if not state.spider_pool:
-        raise HTTPException(503, "Spider page pool not ready")
-
-    page = await state.spider_pool.acquire()
-    page_unhealthy = False
-    fetch_status = "unavailable"
-    try:
-        data, fetch_status = await page.fetch(sku)
-        if fetch_status == "blocked":
-            page_unhealthy = True
-    except Exception as e:
-        log.error("fetch_product error SKU %s: %s", sku, e)
-        page_unhealthy = True
-        raise HTTPException(500, str(e))
-    finally:
-        await state.spider_pool.release(page, unhealthy=page_unhealthy)
+    data, fetch_status = await _fetch_with_profile_recovery(sku)
 
     if not data:
         if fetch_status == "blocked":
