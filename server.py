@@ -35,6 +35,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 SPIDER_MIN_WORKERS = 1
 SPIDER_MAX_WORKERS = 2
 SPIDER_IDLE_WORKER_TTL_SECONDS = 90
+SELLER_CALL_RETRY_DELAYS_SECONDS = (5, 10, 15)
 
 # ─── 全局状态 ───────────────────────────────────────────────────────────────
 
@@ -181,6 +182,37 @@ def _normalize_dimensions_for_sku(dims: dict) -> dict:
     }
 
 
+async def _call_seller_with_retry(method_name: str, *args, **kwargs):
+    last_error: SellerSessionUnavailable | None = None
+    attempts = len(SELLER_CALL_RETRY_DELAYS_SECONDS) + 1
+
+    for attempt in range(1, attempts + 1):
+        manager = state.seller_manager
+        if manager is None:
+            last_error = SellerSessionUnavailable("seller session manager not ready")
+        else:
+            try:
+                return await manager.call_with_failover(method_name, *args, **kwargs)
+            except SellerSessionUnavailable as e:
+                last_error = e
+
+        if attempt >= attempts:
+            break
+
+        delay = SELLER_CALL_RETRY_DELAYS_SECONDS[attempt - 1]
+        log.warning(
+            "seller call %s attempt %d/%d failed: %s; retrying in %ss",
+            method_name,
+            attempt,
+            attempts,
+            last_error,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+    raise last_error or SellerSessionUnavailable(f"seller call failed: {method_name}")
+
+
 # ─── 路由 ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -213,10 +245,8 @@ async def get_sku(sku: str = Query(..., description="Ozon SKU")):
         raise HTTPException(404, f"Product {sku} not found or unavailable")
 
     # 尺寸重量是强依赖，seller 不可用时整条失败
-    if not state.seller_manager:
-        raise HTTPException(503, "Seller session manager not ready")
     try:
-        dims = await state.seller_manager.call_with_failover("fetch_variant_model", sku)
+        dims = await _call_seller_with_retry("fetch_variant_model", sku)
     except SellerSessionUnavailable as e:
         log.warning("seller unavailable for SKU %s: %s", sku, e)
         raise HTTPException(503, "Seller session unavailable")
@@ -237,12 +267,10 @@ async def variant_model(req: SkuListRequest):
     批量查询 SKU 尺寸/重量。
     返回 {sku: {weight, depth, width, height}}
     """
-    if not state.seller_manager:
-        raise HTTPException(503, "Seller session manager not ready")
     results = {}
     for sku in req.skus:
         try:
-            dims = await state.seller_manager.call_with_failover("fetch_variant_model", sku)
+            dims = await _call_seller_with_retry("fetch_variant_model", sku)
         except SellerSessionUnavailable:
             raise HTTPException(503, "Seller session unavailable")
         if dims:
@@ -255,10 +283,8 @@ async def data_v3(req: SkuListRequest):
     """
     批量查询 SKU 销售分析数据（seller data/v3）。
     """
-    if not state.seller_manager:
-        raise HTTPException(503, "Seller session manager not ready")
     try:
-        result = await state.seller_manager.call_with_failover("fetch_data_v3", req.skus)
+        result = await _call_seller_with_retry("fetch_data_v3", req.skus)
     except SellerSessionUnavailable:
         raise HTTPException(503, "Seller session unavailable")
     return {"data": result}

@@ -73,6 +73,131 @@ async def setup_page(context):
     return page
 
 
+async def _dismiss_cookie_banner(page) -> None:
+    try:
+        ok_btn = page.locator('button:has-text("OK")').first
+        if await ok_btn.count() > 0 and await ok_btn.is_visible():
+            await ok_btn.click()
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+
+async def _detect_buybox_currency(page) -> str | None:
+    try:
+        candidates = await page.evaluate(
+            """
+            () => {
+                const items = [];
+                const els = Array.from(document.querySelectorAll('div, span, a, button'));
+                for (const el of els) {
+                    const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (!text || (!text.includes('¥') && !text.includes('₽'))) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) continue;
+                    if (r.x < window.innerWidth * 0.5) continue;
+                    if (r.y < 0 || r.y > window.innerHeight * 0.85) continue;
+                    items.push({
+                        text: text.slice(0, 160),
+                        x: Math.round(r.x),
+                        y: Math.round(r.y),
+                        w: Math.round(r.width),
+                        h: Math.round(r.height),
+                    });
+                }
+                items.sort((a, b) => a.y - b.y || a.x - b.x);
+                return items;
+            }
+            """
+        )
+        for item in candidates or []:
+            text = str(item.get("text") or "")
+            if "¥" in text:
+                log.info("buybox currency detected as CNY from text: %s", text)
+                return "CNY"
+        for item in candidates or []:
+            text = str(item.get("text") or "")
+            if "₽" in text:
+                log.info("buybox currency detected as RUB from text: %s", text)
+                return "RUB"
+    except Exception as e:
+        log.info("detect buybox currency failed: %s", e)
+    return None
+
+
+async def _open_language_currency_modal(page) -> bool:
+    try:
+        await _dismiss_cookie_banner(page)
+        ru_btn = page.locator('button:has-text("RU")').first
+        if await ru_btn.count() == 0:
+            return False
+        await ru_btn.click(timeout=5000)
+        await page.locator('text=Язык и валюта').wait_for(timeout=5000)
+        await asyncio.sleep(0.5)
+        return True
+    except Exception as e:
+        log.info("open language/currency modal failed: %s", e)
+        return False
+
+
+async def _close_language_currency_modal(page) -> None:
+    try:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.2)
+    except Exception:
+        pass
+
+
+async def ensure_currency_cny(page) -> bool:
+    """
+    Ensure the product page is displayed in CNY before extracting prices.
+    Returns True when the page currency was changed and a refresh is expected.
+    """
+    await _dismiss_cookie_banner(page)
+    current_currency = await _detect_buybox_currency(page)
+    if current_currency == "CNY":
+        return False
+
+    if not await _open_language_currency_modal(page):
+        return False
+
+    try:
+        currency_box = page.get_by_role("combobox").last
+        current_currency = ((await currency_box.text_content()) or "").strip()
+    except Exception as e:
+        log.info("read currency combobox failed: %s", e)
+        await _close_language_currency_modal(page)
+        return False
+
+    if "cny" in current_currency.casefold() or "китайский юань" in current_currency.casefold():
+        log.info("currency already CNY: %s", current_currency)
+        await _close_language_currency_modal(page)
+        return False
+
+    try:
+        await currency_box.click(timeout=5000)
+        await asyncio.sleep(0.5)
+        await page.locator('text=Китайский юань').first.click(timeout=5000)
+        await asyncio.sleep(0.3)
+        await page.locator('button:has-text("Сохранить")').click(timeout=5000)
+        log.info("currency changed to CNY, waiting for page refresh")
+        await page.wait_for_load_state("domcontentloaded", timeout=60000)
+        await asyncio.sleep(3)
+        return True
+    except Exception as e:
+        log.warning("set currency CNY failed: %s", e)
+        await _close_language_currency_modal(page)
+        return False
+
+
+def _strip_empty_optional_fields(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return data
+    if data.get("specifications", None) == "":
+        data.pop("specifications", None)
+    return data
+
+
 async def handle_challenge(page, label="", max_attempts=6) -> str:
     """Handle challenge/slider on current page. Return final state."""
     clean_url = page.url.split("?", 1)[0] if "/product/" in page.url else page.url
@@ -372,6 +497,23 @@ async def fetch_product(page, sku: str) -> tuple[dict | None, str]:
         log.warning(f"SKU {sku}: unexpected final state '{state}'")
         return None, "unavailable"
 
+    currency_changed = await ensure_currency_cny(page)
+    if currency_changed:
+        state = await wait_stable(page)
+        log.info(f"Product page state after currency change: {state}")
+        if state == STATE_ADULT:
+            state = await handle_adult_prompt(page, sku, label=f"[product {sku}]")
+        if state in (STATE_SLIDER, STATE_CHALLENGE, STATE_BLOCKED):
+            state = await handle_challenge(page, label=f"[product {sku}][currency]", max_attempts=6)
+        if state == STATE_ADULT:
+            state = await handle_adult_prompt(page, sku, label=f"[product {sku}]")
+        if state == STATE_BLOCKED:
+            log.warning(f"SKU {sku}: page blocked after currency change")
+            return None, "blocked"
+        if state != STATE_PRODUCT:
+            log.warning(f"SKU {sku}: unexpected state after currency change '{state}'")
+            return None, "unavailable"
+
     # Fetch Page1 + Page2 in parallel via page JS context (real session, avoids 403)
     page1_url = f"/api/entrypoint-api.bx/page/json/v2?url=%2Fproduct%2F{sku}%2F"
     page2_url = f"/api/entrypoint-api.bx/page/json/v2?url=%2Fproduct%2F{sku}%2F%3Flayout_container%3DpdpPage2column%26layout_page_index%3D2"
@@ -414,6 +556,7 @@ async def fetch_product(page, sku: str) -> tuple[dict | None, str]:
                 pass
         if variant.get('name') and variant.get('price'):
             log.info(f"SKU {sku} SUCCESS (API): {variant['name'][:60]} | price={variant['price']}")
+            variant = _strip_empty_optional_fields(variant)
             return variant, "ok"
         log.warning(f"SKU {sku}: API extraction incomplete (p1={len(page1_widget_states)} p2={len(page2_widget_states)}), falling back to DOM")
 
@@ -424,6 +567,7 @@ async def fetch_product(page, sku: str) -> tuple[dict | None, str]:
         return None, "unavailable"
 
     log.info(f"SKU {sku} SUCCESS (DOM): {data.get('name', '')[:60]} | price={data.get('price')}")
+    data = _strip_empty_optional_fields(data)
     return data, "ok"
 
 
