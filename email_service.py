@@ -366,6 +366,49 @@ class EmailService:
             logger.error(f"获取邮件失败: {e}")
             return emails
 
+    def find_latest_ozon_verification_email(
+        self,
+        max_age_seconds: int = 60,
+        check_spam: bool = True,
+        minutes: int = 10,
+        limit: int = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """返回最近时间窗口内最新的一封 Ozon 验证码邮件及其元数据。"""
+        latest: Optional[Dict[str, Any]] = None
+        latest_dt: Optional[datetime] = None
+
+        for folder in self.get_check_folders(check_spam=check_spam):
+            try:
+                emails = self.get_recent_emails(
+                    folder=folder,
+                    minutes=minutes,
+                    limit=limit,
+                )
+            except Exception as e:
+                logger.warning("检查文件夹 %s 失败: %s", folder, e)
+                continue
+
+            for mail in emails:
+                if not self.is_ozon_verification_email(mail["from"], mail["subject"]):
+                    continue
+                if not self.is_email_within_seconds(mail["date"], max_age_seconds):
+                    continue
+                code = self._extract_ozon_code(mail["body"], mail["subject"])
+                if not code:
+                    continue
+                dt = self.parse_email_datetime(mail["date"])
+                if dt is None:
+                    continue
+                enriched = dict(mail)
+                enriched["folder"] = folder
+                enriched["code"] = code
+                enriched["parsed_date"] = dt
+                if latest_dt is None or dt > latest_dt:
+                    latest = enriched
+                    latest_dt = dt
+
+        return latest
+
     def _get_email_body(self, msg) -> str:
         """提取邮件正文"""
         body = ""
@@ -409,30 +452,15 @@ class EmailService:
         Returns:
             验证码字符串，未找到返回 None
         """
-        folders = self.get_check_folders(check_spam=check_spam)
-
-        for folder in folders:
-            try:
-                emails = self.get_recent_emails(
-                    folder=folder,
-                    minutes=minutes,
-                    limit=10
-                )
-
-                for mail in emails:
-                    if not self.is_ozon_verification_email(mail["from"], mail["subject"]):
-                        continue
-                    if not self.is_email_within_seconds(mail["date"], 60):
-                        continue
-                    code = self._extract_ozon_code(mail["body"], mail["subject"])
-                    if code:
-                        logger.info(f"找到 OZON 验证码: {code} (来自 {folder})")
-                        return code
-
-            except Exception as e:
-                logger.warning(f"检查文件夹 {folder} 失败: {e}")
-                continue
-
+        latest = self.find_latest_ozon_verification_email(
+            max_age_seconds=60,
+            check_spam=check_spam,
+            minutes=minutes,
+            limit=20,
+        )
+        if latest:
+            logger.info("找到 OZON 验证码: %s (来自 %s)", latest["code"], latest["folder"])
+            return str(latest["code"])
         return None
 
     def _extract_ozon_code(self, body: str, subject: str) -> Optional[str]:

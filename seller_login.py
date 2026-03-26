@@ -27,8 +27,10 @@ SELLER_LOGIN_POLL_INTERVAL = 0.25
 SELLER_LOGIN_CHALLENGE_POLL_INTERVAL = 0.5
 SELLER_LOGIN_LOADSTATE_TIMEOUT_MS = 500
 SELLER_VERIFICATION_INITIAL_WAIT_SECONDS = 5
-SELLER_VERIFICATION_POLL_ATTEMPTS = 8
+SELLER_VERIFICATION_POLL_ATTEMPTS = 12
 SELLER_VERIFICATION_POLL_INTERVAL_SECONDS = 5
+SELLER_VERIFICATION_EMAIL_MAX_AGE_SECONDS = 60
+SELLER_VERIFICATION_EMAIL_LOOKBACK_MINUTES = 10
 SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 300
 SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS = 300
 SELLER_LOGIN_PROGRESS_STALE_SECONDS = 900
@@ -615,20 +617,8 @@ class SellerSession:
                         log.error("邮箱输入框存在，但填充失败，URL: %s", self._page.url)
                         return False
                     log.info("邮箱已输入: %s", self.email)
-                    # 记录发送前最新邮件ID（必须在点击发送前记录）
                     email_svc = EmailService(self.email, self.app_password)
                     code = None
-                    folder_last_ids = {}
-                    with email_svc:
-                        email_svc.connect_imap()
-                        try:
-                            for folder in email_svc.get_check_folders(check_spam=True):
-                                ids = email_svc.list_email_ids(folder)
-                                folder_last_ids[folder] = ids[-1] if ids else 0
-                            log.info("发送前各文件夹最新邮件ID: %s", folder_last_ids)
-                        except Exception as e:
-                            log.warning("获取邮件ID失败: %s", e)
-                            folder_last_ids = {"INBOX": 0}
 
                     # 提交
                     send_btn = await self._page.query_selector(
@@ -659,34 +649,21 @@ class SellerSession:
                                 SELLER_VERIFICATION_POLL_ATTEMPTS,
                                 time.monotonic() - send_requested_monotonic,
                             )
-                            for folder in list(folder_last_ids):
-                                try:
-                                    all_ids = email_svc.list_email_ids(folder)
-                                    new_ids = [x for x in all_ids if x > folder_last_ids.get(folder, 0)]
-                                    log.info(
-                                        "检查文件夹 %s: baseline_id=%d latest_id=%d new_count=%d",
-                                        folder,
-                                        folder_last_ids.get(folder, 0),
-                                        all_ids[-1] if all_ids else 0,
-                                        len(new_ids),
-                                    )
-                                    for eid in reversed(new_ids):
-                                        mail = email_svc.fetch_email_by_id(folder, eid)
-                                        if not mail or not email_svc.is_ozon_verification_email(mail["from"], mail["subject"]):
-                                            continue
-                                        if not email_svc.is_email_within_seconds(mail["date"], 30):
-                                            continue
-                                        c = email_svc._extract_ozon_code(mail["body"], mail["subject"])
-                                        if c:
-                                            code = c
-                                            log.info("收到新验证码: %s (folder=%s, ID=%d)", c, folder, eid)
-                                            break
-                                    if all_ids:
-                                        folder_last_ids[folder] = all_ids[-1]
-                                    if code:
-                                        break
-                                except Exception as e:
-                                    log.warning("检查文件夹 %s 失败: %s", folder, e)
+                            latest_mail = email_svc.find_latest_ozon_verification_email(
+                                max_age_seconds=SELLER_VERIFICATION_EMAIL_MAX_AGE_SECONDS,
+                                check_spam=True,
+                                minutes=SELLER_VERIFICATION_EMAIL_LOOKBACK_MINUTES,
+                                limit=20,
+                            )
+                            if latest_mail:
+                                code = str(latest_mail["code"])
+                                log.info(
+                                    "收到最新验证码: %s (folder=%s, ID=%s, date=%s)",
+                                    code,
+                                    latest_mail["folder"],
+                                    latest_mail["id"],
+                                    latest_mail["date"],
+                                )
                             if code:
                                 break
                             if attempt < SELLER_VERIFICATION_POLL_ATTEMPTS - 1:
