@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ SELLER_VERIFICATION_EMAIL_MAX_AGE_SECONDS = 60
 SELLER_VERIFICATION_EMAIL_LOOKBACK_MINUTES = 10
 SELLER_POST_CODE_FLOW_TIMEOUT_SECONDS = 60
 SELLER_EXISTING_FLOW_TIMEOUT_SECONDS = 60
+SELLER_FAILED_SESSION_HOLD_SECONDS = 30
 SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 300
 SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS = 300
 SELLER_LOGIN_PROGRESS_STALE_SECONDS = 900
@@ -539,8 +541,10 @@ class SellerSession:
             await asyncio.sleep(5)
             url = self._page.url
             log.info("恢复 session 后 URL: %s", url)
-            # 只有确实在 signin/ozonid/sso 才算失败
             if any(k in url for k in ["signin", "ozonid", "sso.ozon"]):
+                if await self._handle_existing_authenticated_flow():
+                    log.info("恢复 session 后通过已认证流程进入 seller")
+                    return True
                 return False
             log.info("session 验证通过")
             return True
@@ -922,6 +926,30 @@ class SellerSession:
             await self._playwright.stop()
         if self._chrome_proc:
             kill(self._chrome_proc)
+
+    def purge_session_artifacts(self, reason: str) -> None:
+        """删除失效 seller session 的持久化状态，避免重复恢复脏 profile。"""
+        try:
+            self.storage_state_file.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning("清理 seller state 失败 %s (%s): %s", self.storage_state_file, reason, e)
+        try:
+            if self.profile_dir.exists():
+                shutil.rmtree(self.profile_dir, ignore_errors=True)
+        except Exception as e:
+            log.warning("清理 seller profile 失败 %s (%s): %s", self.profile_dir, reason, e)
+
+    async def hold_before_close(self, reason: str, seconds: int = SELLER_FAILED_SESSION_HOLD_SECONDS) -> None:
+        if seconds <= 0:
+            return
+        log.warning(
+            "seller session failure hold: email=%s reason=%s url=%s hold=%ss",
+            self.email,
+            reason,
+            self._page.url if self._page else "",
+            seconds,
+        )
+        await asyncio.sleep(seconds)
 
 
 async def get_seller_session(
@@ -1385,6 +1413,7 @@ class SellerSessionManager:
             self._persist_accounts_locked()
         if failed:
             await failed.close()
+            failed.purge_session_artifacts("state_restore_failed")
         return None
 
     async def _attempt_login(self, acct: dict) -> Optional[SellerSession]:
@@ -1423,5 +1452,6 @@ class SellerSessionManager:
             acct["last_login_started_at"] = None
             self._persist_accounts_locked()
         if failed:
+            await failed.hold_before_close(failure_reason)
             await failed.close()
         return None

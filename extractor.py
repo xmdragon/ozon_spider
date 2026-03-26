@@ -138,6 +138,17 @@ def _build_specifications(attributes: list[dict]) -> str:
     return " / ".join(parts)
 
 
+def _specifications_duplicated_in_attributes(specifications: str, attributes: list[dict]) -> bool:
+    spec = " ".join(str(specifications or "").split()).casefold()
+    if not spec:
+        return False
+    for item in attributes:
+        value = " ".join(str(item.get("value") or "").split()).casefold()
+        if value and spec in value:
+            return True
+    return False
+
+
 def extract_variant_from_api(page1_widget_states: dict, page2_widget_states: dict, sku: str) -> dict:
     """
     Build a VariantFullData dict from captured Page1 + Page2 widgetStates.
@@ -293,6 +304,8 @@ def extract_variant_from_api(page1_widget_states: dict, page2_widget_states: dic
 
     if not result["specifications"]:
         result["specifications"] = _build_specifications(result["attributes"])
+    if _specifications_duplicated_in_attributes(result["specifications"], result["attributes"]):
+        result["specifications"] = ""
 
     return result
 
