@@ -31,6 +31,8 @@ SELLER_VERIFICATION_POLL_ATTEMPTS = 12
 SELLER_VERIFICATION_POLL_INTERVAL_SECONDS = 5
 SELLER_VERIFICATION_EMAIL_MAX_AGE_SECONDS = 60
 SELLER_VERIFICATION_EMAIL_LOOKBACK_MINUTES = 10
+SELLER_POST_CODE_FLOW_TIMEOUT_SECONDS = 60
+SELLER_EXISTING_FLOW_TIMEOUT_SECONDS = 60
 SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 300
 SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS = 300
 SELLER_LOGIN_PROGRESS_STALE_SECONDS = 900
@@ -211,6 +213,16 @@ class SellerSession:
         inputs = await self._page.query_selector_all('input')
         for inp in inputs:
             t = await inp.get_attribute('type') or 'text'
+            autocomplete = (await inp.get_attribute('autocomplete') or '').lower()
+            inputmode = (await inp.get_attribute('inputmode') or '').lower()
+            name = (await inp.get_attribute('name') or '').lower()
+            placeholder = (await inp.get_attribute('placeholder') or '').lower()
+            if autocomplete == "one-time-code":
+                continue
+            if inputmode == "numeric":
+                continue
+            if "code" in name or "код" in placeholder:
+                continue
             if t in ('text', 'email', ''):
                 return inp
         return None
@@ -317,19 +329,41 @@ class SellerSession:
             await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
         return "timeout"
 
-    async def _wait_for_post_code_ready(self, timeout: int = 30) -> str:
+    async def _wait_for_post_code_ready(self, timeout: int = SELLER_POST_CODE_FLOW_TIMEOUT_SECONDS) -> str:
         deadline = time.time() + timeout
+        saw_transition = False
         while time.time() < deadline:
             url = self._page.url
             if self._is_authenticated_seller_url(url):
                 return "authenticated"
+            if "auth/2fa" in url or "otp" in url:
+                saw_transition = True
+                try:
+                    await self._page.wait_for_load_state("domcontentloaded", timeout=SELLER_LOGIN_LOADSTATE_TIMEOUT_MS)
+                except Exception:
+                    pass
+                await asyncio.sleep(SELLER_LOGIN_CHALLENGE_POLL_INTERVAL)
+                continue
             if await self._has_next_button():
                 return "next"
-            if await self._find_email_input():
-                return "email_input"
             code_input = await self._find_code_input()
             if code_input:
-                return "code_input"
+                saw_transition = True
+                try:
+                    await self._page.wait_for_load_state("domcontentloaded", timeout=SELLER_LOGIN_LOADSTATE_TIMEOUT_MS)
+                except Exception:
+                    pass
+                await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
+                continue
+            if await self._find_email_input():
+                if saw_transition:
+                    return "email_input"
+                try:
+                    await self._page.wait_for_load_state("domcontentloaded", timeout=SELLER_LOGIN_LOADSTATE_TIMEOUT_MS)
+                except Exception:
+                    pass
+                await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
+                continue
             try:
                 await self._page.wait_for_load_state("domcontentloaded", timeout=SELLER_LOGIN_LOADSTATE_TIMEOUT_MS)
             except Exception:
@@ -403,13 +437,14 @@ class SellerSession:
         log.info("点击下一步后状态: %s | URL: %s", result, self._page.url)
         return True
 
-    async def _handle_existing_authenticated_flow(self) -> bool:
+    async def _handle_existing_authenticated_flow(self, timeout: int = SELLER_EXISTING_FLOW_TIMEOUT_SECONDS) -> bool:
         """处理 2FA/回落 signin 后只需点“下一步”的已认证流程。"""
         if not self._page:
             return False
 
         saw_2fa = False
-        for _ in range(12):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
             url = self._page.url
             if self._is_authenticated_seller_url(url):
                 return True
