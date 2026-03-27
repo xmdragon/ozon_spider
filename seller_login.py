@@ -38,6 +38,13 @@ SELLER_FAILED_SESSION_HOLD_SECONDS = 30
 SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 300
 SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS = 300
 SELLER_LOGIN_PROGRESS_STALE_SECONDS = 900
+# seller 尺寸查询状态：
+# - ok: seller 查询成功，且解析到尺寸/重量
+# - no_data: seller 查询成功，但没有命中记录或记录里没有尺寸字段
+# - request_failed: seller 请求异常、非 200、空 payload 等请求侧失败
+VARIANT_MODEL_STATUS_OK = "ok"
+VARIANT_MODEL_STATUS_NO_DATA = "no_data"
+VARIANT_MODEL_STATUS_REQUEST_FAILED = "request_failed"
 
 
 def _now_local() -> datetime:
@@ -65,6 +72,20 @@ def _dt_to_iso(value: Optional[datetime]) -> Optional[str]:
     if not value:
         return None
     return value.astimezone().isoformat(timespec="seconds")
+
+
+def _variant_model_result(
+    sku: str,
+    status: str,
+    dimensions: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "sku": str(sku),
+        "status": status,
+        "dimensions": dimensions,
+        "error": error,
+    }
 
 
 def _ensure_retry_cooldown(
@@ -162,6 +183,50 @@ class SellerSession:
             or "下一步" in body
             or "Далее" in body
         )
+
+    async def _click_login_button(self) -> bool:
+        url = self._page.url if self._page else ""
+        if "seller.ozon.ru/app/registration/signin" not in url:
+            return False
+        try:
+            clicked = await self._page.evaluate("""
+                () => {
+                    const exactTexts = new Set(['登录', 'Войти']);
+                    for (const el of document.querySelectorAll('button, [role="button"], a, input[type="submit"]')) {
+                        const raw = el.tagName === 'INPUT'
+                            ? (el.value || '')
+                            : (el.textContent || '');
+                        const text = raw.trim();
+                        if (!exactTexts.has(text)) {
+                            continue;
+                        }
+                        el.click();
+                        return `${el.tagName}:${text}`;
+                    }
+                    return null;
+                }
+            """)
+        except Exception as e:
+            if self._is_authenticated_seller_url(self._page.url):
+                return True
+            if "navigating" in str(e).lower():
+                try:
+                    await self._page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                return True
+            raise
+
+        if not clicked:
+            return False
+
+        log.info("点击登录按钮: %s", clicked)
+        try:
+            await self._page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
+        await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
+        return True
 
     async def _wait_for_login_ready(self, label: str, timeout: int = SELLER_LOGIN_READY_TIMEOUT) -> str:
         deadline = time.time() + timeout
@@ -440,7 +505,7 @@ class SellerSession:
         return True
 
     async def _handle_existing_authenticated_flow(self, timeout: int = SELLER_EXISTING_FLOW_TIMEOUT_SECONDS) -> bool:
-        """处理 2FA/回落 signin 后只需点“下一步”的已认证流程。"""
+        """处理 2FA/回落 signin 后只需点“登录/下一步”的已认证流程。"""
         if not self._page:
             return False
 
@@ -459,6 +524,11 @@ class SellerSession:
                 continue
 
             if await self._click_next_button():
+                if self._is_authenticated_seller_url(self._page.url):
+                    return True
+                continue
+
+            if await self._click_login_button():
                 if self._is_authenticated_seller_url(self._page.url):
                     return True
                 continue
@@ -537,17 +607,32 @@ class SellerSession:
             if not cookies:
                 return False
             await self._context.add_cookies(cookies)
-            await self._page.goto(SELLER_DASHBOARD, timeout=30000, wait_until="domcontentloaded")
-            await asyncio.sleep(5)
+            goto_error = None
+            try:
+                await self._page.goto(SELLER_DASHBOARD, timeout=30000, wait_until="domcontentloaded")
+            except Exception as e:
+                goto_error = e
+                log.warning("恢复 session 跳转 dashboard 异常，继续检查当前页面: %s", e)
+            try:
+                await self._page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+            ready_state = await self._wait_for_login_ready("恢复 session 后", timeout=30)
             url = self._page.url
-            log.info("恢复 session 后 URL: %s", url)
-            if any(k in url for k in ["signin", "ozonid", "sso.ozon"]):
+            if goto_error:
+                log.info("恢复 session 后状态: %s | URL: %s | goto_error: %s", ready_state, url, goto_error)
+            else:
+                log.info("恢复 session 后状态: %s | URL: %s", ready_state, url)
+            if ready_state == "authenticated":
+                log.info("session 验证通过")
+                return True
+            if ready_state == "ready" or any(k in url for k in ["signin", "ozonid", "sso"]):
                 if await self._handle_existing_authenticated_flow():
                     log.info("恢复 session 后通过已认证流程进入 seller")
                     return True
                 return False
-            log.info("session 验证通过")
-            return True
+            return False
         except Exception as e:
             log.warning("恢复 session 失败: %s", e)
             return False
@@ -579,10 +664,7 @@ class SellerSession:
                 return False
 
             # 步骤1: 点击「登录」按钮
-            login_btn = await self._page.query_selector('button[type="submit"]:has-text("登录"), button:has-text("Войти")')
-            if login_btn:
-                await login_btn.evaluate('el => el.click()')
-                log.info("点击登录按钮")
+            if await self._click_login_button():
                 post_click_state = await self._wait_for_login_ready("点击登录后", timeout=60)
                 log.info("点击登录后状态: %s | URL: %s", post_click_state, self._page.url)
                 if post_click_state == "authenticated":
@@ -742,10 +824,7 @@ class SellerSession:
 
             # 如果还在 signin，再点一次登录按钮
             if "signin" in self._page.url or "registration" in self._page.url:
-                btn = await self._page.query_selector('button[type="submit"]:has-text("登录"), button:has-text("Войти")')
-                if btn:
-                    await btn.evaluate('el => el.click()')
-                    log.info("再次点击登录按钮")
+                if await self._click_login_button():
                     post_click_state = await self._wait_for_login_ready("再次点击登录后", timeout=30)
                     log.info("再次点击登录后状态: %s | URL: %s", post_click_state, self._page.url)
 
@@ -832,10 +911,20 @@ class SellerSession:
             return False
         return not any(k in self._page.url for k in ("signin", "ozonid", "sso", "registration"))
 
-    async def fetch_variant_model(self, sku: str) -> Optional[Dict[str, Any]]:
+    async def fetch_variant_model_result(self, sku: str) -> Dict[str, Any]:
         """
-        请求 search-variant-model 获取单个 SKU 的尺寸/重量。
-        返回 {"weight": g, "depth": mm, "width": mm, "height": mm} 或 None。
+        请求 search-variant-model 获取单个 SKU 的尺寸/重量状态。
+
+        返回:
+        - {"sku", "status", "dimensions", "error"}
+
+        其中 status 含义为:
+        - ok: seller 查询成功，且拿到了尺寸/重量
+        - no_data: seller 查询成功，但这条 SKU 没有尺寸数据
+        - request_failed: seller 请求失败或返回异常 payload
+
+        注意:
+        - seller 会话失效/未授权不走 status，直接抛 SellerSessionUnavailable
         """
         try:
             status, data = await self._page_fetch(
@@ -844,12 +933,24 @@ class SellerSession:
             )
             if status in (401, 403):
                 raise SellerSessionUnavailable(f"variant-model unauthorized for {self.email}: status={status}")
-            if status != 200 or not data:
+            if status != 200:
                 log.warning("variant-model SKU %s status=%d", sku, status)
-                return None
+                return _variant_model_result(
+                    sku,
+                    VARIANT_MODEL_STATUS_REQUEST_FAILED,
+                    error=f"http_{status}",
+                )
+            if not data:
+                log.warning("variant-model SKU %s empty payload", sku)
+                return _variant_model_result(
+                    sku,
+                    VARIANT_MODEL_STATUS_REQUEST_FAILED,
+                    error="empty_payload",
+                )
             items = data.get("items", [])
             if not items:
-                return None
+                log.info("variant-model SKU %s returned 0 items", sku)
+                return _variant_model_result(sku, VARIANT_MODEL_STATUS_NO_DATA)
             attrs = items[0].get("attributes", [])
             dimensions = {}
             for attr in attrs:
@@ -859,8 +960,15 @@ class SellerSession:
                         dimensions[self._DIMENSION_ATTR_KEYS[key]] = float(attr["value"])
                     except (ValueError, KeyError):
                         pass
+            if not dimensions:
+                log.info("variant-model SKU %s returned item without dimensions", sku)
+                return _variant_model_result(sku, VARIANT_MODEL_STATUS_NO_DATA)
             log.info("SKU %s dimensions: %s", sku, dimensions)
-            return dimensions or None
+            return _variant_model_result(
+                sku,
+                VARIANT_MODEL_STATUS_OK,
+                dimensions=dimensions,
+            )
         except SellerSessionUnavailable:
             raise
         except Exception as e:
@@ -868,7 +976,17 @@ class SellerSession:
             if "closed" in msg.lower() or "target page" in msg.lower():
                 raise SellerSessionUnavailable(f"variant-model page closed for {self.email}: {e}") from e
             log.warning("fetch_variant_model error: %s", e)
+            return _variant_model_result(
+                sku,
+                VARIANT_MODEL_STATUS_REQUEST_FAILED,
+                error=type(e).__name__,
+            )
+
+    async def fetch_variant_model(self, sku: str) -> Optional[Dict[str, Any]]:
+        result = await self.fetch_variant_model_result(sku)
+        if result["status"] != VARIANT_MODEL_STATUS_OK:
             return None
+        return result["dimensions"]
 
     async def fetch_data_v3(self, skus: list) -> Optional[Dict[str, Any]]:
         """

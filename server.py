@@ -182,6 +182,23 @@ def _normalize_dimensions_for_sku(dims: dict) -> dict:
     }
 
 
+def _seller_dimensions_error_detail(sku: str, result: dict) -> dict:
+    status = result.get("status")
+    if status == "no_data":
+        code = "seller_dimensions_not_found"
+        message = f"Seller queried successfully but no dimensions found for SKU {sku}"
+    else:
+        code = "seller_dimensions_request_failed"
+        message = f"Seller request failed while fetching dimensions for SKU {sku}"
+    return {
+        "code": code,
+        "message": message,
+        "sku": str(sku),
+        "seller_status": status,
+        "seller_error": result.get("error"),
+    }
+
+
 async def _call_seller_with_retry(method_name: str, *args, **kwargs):
     last_error: SellerSessionUnavailable | None = None
     attempts = len(SELLER_CALL_RETRY_DELAYS_SECONDS) + 1
@@ -235,7 +252,16 @@ async def health():
 @app.get("/sku")
 async def get_sku(sku: str = Query(..., description="Ozon SKU")):
     """
-    抓取商品完整数据，自动补充尺寸重量（如果 seller session 就绪）。
+    抓取商品完整数据，并返回 seller 尺寸查询状态。
+
+    seller_dimensions_status 语义:
+    - ok: seller 查询成功，dimensions 已填充
+    - no_data: seller 查询成功，但没有查到尺寸；仍返回 200，dimensions 为 null，
+      并在 seller_dimensions_detail 中说明原因
+
+    异常语义:
+    - seller session 不可用: 503 / seller_session_unavailable
+    - seller 请求失败: 502 / seller_dimensions_request_failed
     """
     data, fetch_status = await _fetch_with_profile_recovery(sku)
 
@@ -244,15 +270,26 @@ async def get_sku(sku: str = Query(..., description="Ozon SKU")):
             raise HTTPException(503, f"Product {sku} blocked by upstream antibot")
         raise HTTPException(404, f"Product {sku} not found or unavailable")
 
-    # 尺寸重量是强依赖，seller 不可用时整条失败
+    # seller 请求失败时整条失败；seller 查无尺寸时降级返回商品数据
     try:
-        dims = await _call_seller_with_retry("fetch_variant_model", sku)
+        variant_result = await _call_seller_with_retry("fetch_variant_model_result", sku)
     except SellerSessionUnavailable as e:
         log.warning("seller unavailable for SKU %s: %s", sku, e)
-        raise HTTPException(503, "Seller session unavailable")
-    if not dims:
-        raise HTTPException(502, f"Dimensions unavailable for SKU {sku}")
-    data["dimensions"] = _normalize_dimensions_for_sku(dims)
+        raise HTTPException(503, {
+            "code": "seller_session_unavailable",
+            "message": "Seller session unavailable",
+            "sku": str(sku),
+        })
+    if variant_result.get("status") == "no_data":
+        data["dimensions"] = None
+        data["seller_dimensions_status"] = "no_data"
+        data["seller_dimensions_detail"] = _seller_dimensions_error_detail(sku, variant_result)
+        return data
+    if variant_result.get("status") != "ok":
+        raise HTTPException(502, _seller_dimensions_error_detail(sku, variant_result))
+    data["dimensions"] = _normalize_dimensions_for_sku(variant_result["dimensions"])
+    data["seller_dimensions_status"] = "ok"
+    data["seller_dimensions_detail"] = None
 
     return data
 
@@ -265,17 +302,30 @@ class SkuListRequest(BaseModel):
 async def variant_model(req: SkuListRequest):
     """
     批量查询 SKU 尺寸/重量。
-    返回 {sku: {weight, depth, width, height}}
+
+    返回:
+    - dimensions: 仅包含 status=ok 的 SKU 尺寸结果
+    - results[sku]: 每个 SKU 的 seller 查询状态
+
+    results[sku].status 语义:
+    - ok: seller 查询成功，且拿到了尺寸/重量
+    - no_data: seller 查询成功，但该 SKU 没有尺寸数据
+    - request_failed: seller 请求失败或返回异常 payload
     """
+    dimensions = {}
     results = {}
     for sku in req.skus:
         try:
-            dims = await _call_seller_with_retry("fetch_variant_model", sku)
+            result = await _call_seller_with_retry("fetch_variant_model_result", sku)
         except SellerSessionUnavailable:
-            raise HTTPException(503, "Seller session unavailable")
-        if dims:
-            results[sku] = dims
-    return {"dimensions": results, "total": len(results)}
+            raise HTTPException(503, {
+                "code": "seller_session_unavailable",
+                "message": "Seller session unavailable",
+            })
+        results[sku] = result
+        if result.get("status") == "ok" and result.get("dimensions"):
+            dimensions[sku] = result["dimensions"]
+    return {"dimensions": dimensions, "results": results, "total": len(dimensions)}
 
 
 @app.post("/data-v3")
