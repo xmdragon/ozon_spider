@@ -120,6 +120,18 @@ async def test_restore_session_keeps_existing_flow_after_dashboard_timeout(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_probe_api_treats_400_as_alive_session():
+    session = SellerSession(
+        email="seller@example.com",
+        app_password="secret",
+        client_id="123",
+    )
+    session._page_fetch = AsyncMock(return_value=(400, {"code": "bad_request"}))
+
+    assert await session.probe_api() is True
+
+
+@pytest.mark.asyncio
 async def test_manager_multi_master_round_robin_selection():
     manager = SellerSessionManager([
         {"email": "a@example.com", "app_password": "x", "client_id": "1"},
@@ -153,23 +165,22 @@ async def test_manager_multi_master_removes_failed_session_and_uses_next():
 
 
 @pytest.mark.asyncio
-async def test_manager_probe_requires_two_failures_before_removal():
+async def test_ensure_pool_does_not_probe_when_pool_is_full():
     manager = SellerSessionManager([
         {"email": "a@example.com", "app_password": "x", "client_id": "1"},
         {"email": "b@example.com", "app_password": "y", "client_id": "2"},
     ])
     manager._persist_accounts_locked = lambda: None
-    manager._schedule_recovery = lambda: None
-    flaky = PoolFakeSession("a@example.com", [], probe_results=[False, False])
-    healthy = PoolFakeSession("b@example.com", [])
-    manager._sessions = [flaky, healthy]
+    manager._sessions = [
+        PoolFakeSession("a@example.com", []),
+        PoolFakeSession("b@example.com", []),
+    ]
+    manager._drop_dead_sessions_locked = AsyncMock()
 
-    assert await manager._probe_sessions([flaky, healthy]) is False
+    await manager.ensure_pool()
+
+    manager._drop_dead_sessions_locked.assert_awaited_once()
     assert [session.email for session in manager._sessions] == ["a@example.com", "b@example.com"]
-
-    assert await manager._probe_sessions([flaky, healthy]) is True
-    assert flaky.closed is True
-    assert [session.email for session in manager._sessions] == ["b@example.com"]
 
 
 @pytest.mark.asyncio

@@ -892,13 +892,13 @@ class SellerSession:
         return result.get('status', 0), result.get('data')
 
     async def probe_api(self) -> bool:
-        """用轻量 seller API 检查当前 session 是否可用。"""
+        """用轻量 seller API 检查当前 session 是否仍然授权可用。"""
         try:
             status, _ = await self._page_fetch(
                 "https://seller.ozon.ru/api/v1/search-variant-model",
                 {"limit": "1", "name": "1"},
             )
-            return status == 200
+            return status not in (0, 401, 403)
         except Exception as e:
             log.warning("seller probe failed for %s: %s", self.email, e)
             return False
@@ -1273,14 +1273,7 @@ class SellerSessionManager:
                 await self._drop_dead_sessions_locked()
                 self._persist_accounts_locked()
                 if self._session_count_locked() >= target_count:
-                    probe_candidates = list(self._sessions)
-                else:
-                    probe_candidates = []
-            if probe_candidates:
-                removed = await self._probe_sessions(probe_candidates)
-                if removed:
-                    continue
-                return
+                    return
 
             async with self._lock:
                 if self._session_count_locked() >= target_count:
@@ -1557,50 +1550,6 @@ class SellerSessionManager:
             log.warning("seller session dead: %s", session.email)
             await session.close()
 
-    async def _probe_sessions(self, sessions: list[SellerSession]) -> bool:
-        removed_any = False
-        for session in sessions:
-            if session._request_lock.locked():
-                continue
-            try:
-                async with session._request_lock:
-                    ok = await session.probe_api()
-            except Exception as e:
-                ok = False
-                log.warning("seller probe raised for %s: %s", session.email, e)
-
-            async with self._lock:
-                if ok:
-                    self._mark_session_health_locked(session.email, ok=True)
-                    continue
-                failure_count = self._mark_session_health_locked(session.email, ok=False)
-                if failure_count < SELLER_SESSION_SOFT_FAILURE_THRESHOLD:
-                    log.warning(
-                        "seller probe soft failure %d/%d: %s",
-                        failure_count,
-                        SELLER_SESSION_SOFT_FAILURE_THRESHOLD,
-                        session.email,
-                    )
-                    continue
-                removed = self._remove_session_locked(
-                    session,
-                    acct_status="stale",
-                    reason="probe_api_failed",
-                )
-                if removed:
-                    self._last_failure = {
-                        "email": session.email,
-                        "reason": "probe_api_failed",
-                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    }
-                    self._schedule_recovery()
-                else:
-                    removed = False
-            if removed:
-                removed_any = True
-                log.warning("seller session probe failed: %s", session.email)
-                await session.close()
-        return removed_any
 
     def _account_locked(self, email: str) -> Optional[dict]:
         for acct in self._accounts:
