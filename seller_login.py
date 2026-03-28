@@ -38,6 +38,7 @@ SELLER_FAILED_SESSION_HOLD_SECONDS = 30
 SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 300
 SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS = 300
 SELLER_LOGIN_PROGRESS_STALE_SECONDS = 900
+SELLER_SESSION_SOFT_FAILURE_THRESHOLD = 2
 # seller 尺寸查询状态：
 # - ok: seller 查询成功，且解析到尺寸/重量
 # - no_data: seller 查询成功，但没有命中记录或记录里没有尺寸字段
@@ -127,6 +128,7 @@ class SellerSession:
         self._browser = None
         self._context = None
         self._page = None
+        self._request_lock = asyncio.Lock()
 
     @property
     def page(self):
@@ -1164,20 +1166,33 @@ def _cooldown_active(acct: dict) -> bool:
 
 
 class SellerSessionManager:
-    """Manage active/standby seller sessions with background recovery."""
+    """Manage a multi-master seller session pool with background recovery."""
 
     def __init__(self, accounts: list):
         self._account_file = ACCOUNT_JSON_PATH
         self._accounts = [_normalize_account(acct, idx) for idx, acct in enumerate(accounts)]
         self._boot_time = _now_local()
-        self.active_session: Optional[SellerSession] = None
-        self.standby_session: Optional[SellerSession] = None
+        self._sessions: list[SellerSession] = []
+        self._session_inflight: Dict[str, int] = {}
+        self._session_soft_failures: Dict[str, int] = {}
+        self._rr_cursor = 0
         self._lock = asyncio.Lock()
         self._recovery_task: Optional[asyncio.Task] = None
         self._recovery_wakeup = asyncio.Event()
         self._stopped = False
         self._last_failure: Optional[Dict[str, Any]] = None
         self._last_recovery_error: Optional[str] = None
+
+    @property
+    def active_session(self) -> Optional[SellerSession]:
+        return self._sessions[0] if self._sessions else None
+
+    @property
+    def standby_session(self) -> Optional[SellerSession]:
+        return self._sessions[1] if len(self._sessions) > 1 else None
+
+    def _target_session_count(self) -> int:
+        return min(2, len(self._accounts))
 
     async def start(self):
         async with self._lock:
@@ -1210,9 +1225,11 @@ class SellerSessionManager:
                     acct["login_in_progress"] = False
                     acct["last_login_started_at"] = None
             self._persist_accounts_locked()
-            sessions = [self.active_session, self.standby_session]
-            self.active_session = None
-            self.standby_session = None
+            sessions = list(self._sessions)
+            self._sessions = []
+            self._session_inflight.clear()
+            self._session_soft_failures.clear()
+            self._rr_cursor = 0
         for session in sessions:
             if session:
                 await session.close()
@@ -1247,15 +1264,24 @@ class SellerSessionManager:
                 pass
 
     async def ensure_pool(self):
-        target_count = min(2, len(self._accounts))
-        async with self._lock:
-            if self._stopped:
-                return
-            self._sanitize_accounts_locked()
-            await self._drop_dead_sessions_locked()
-            self._persist_accounts_locked()
-
+        target_count = self._target_session_count()
         while not self._stopped:
+            async with self._lock:
+                if self._stopped:
+                    return
+                self._sanitize_accounts_locked()
+                await self._drop_dead_sessions_locked()
+                self._persist_accounts_locked()
+                if self._session_count_locked() >= target_count:
+                    probe_candidates = list(self._sessions)
+                else:
+                    probe_candidates = []
+            if probe_candidates:
+                removed = await self._probe_sessions(probe_candidates)
+                if removed:
+                    continue
+                return
+
             async with self._lock:
                 if self._session_count_locked() >= target_count:
                     return
@@ -1288,40 +1314,79 @@ class SellerSessionManager:
                 return
 
     async def call_with_failover(self, method_name: str, *args, **kwargs):
-        async with self._lock:
-            await self._drop_dead_sessions_locked()
-            session = self.active_session
-            standby = self.standby_session
+        last_error: Optional[SellerSessionUnavailable] = None
+        tried_emails: set[str] = set()
 
-            if not session:
-                self._schedule_recovery()
-                raise SellerSessionUnavailable("no active seller session")
+        while True:
+            async with self._lock:
+                await self._drop_dead_sessions_locked()
+                session = self._checkout_session_locked(tried_emails)
+                if not session:
+                    self._schedule_recovery()
+                    raise last_error or SellerSessionUnavailable("no healthy seller session")
 
             try:
-                return await getattr(session, method_name)(*args, **kwargs)
+                async with session._request_lock:
+                    result = await getattr(session, method_name)(*args, **kwargs)
+                    soft_failed = self._result_is_soft_failure(method_name, result)
             except SellerSessionUnavailable as e:
-                await self._retire_active_locked(str(e))
-                if not standby:
-                    self._schedule_recovery()
-                    raise
-                self.active_session = standby
-                self.standby_session = None
-                log.warning("seller failover: promote standby %s", standby.email)
-                try:
-                    result = await getattr(self.active_session, method_name)(*args, **kwargs)
-                except SellerSessionUnavailable as standby_error:
-                    await self._retire_active_locked(str(standby_error))
-                    self._schedule_recovery()
-                    raise
-                self._schedule_recovery()
-                return result
+                last_error = e
+                tried_emails.add(session.email)
+                async with self._lock:
+                    self._release_session_locked(session)
+                    removed = self._remove_session_locked(
+                        session,
+                        acct_status="failed",
+                        reason=str(e),
+                    )
+                    if removed:
+                        self._schedule_recovery()
+                if removed:
+                    log.warning("seller pool removed failed session: %s (%s)", session.email, e)
+                    await session.close()
+                continue
+
+            async with self._lock:
+                remove = False
+                if soft_failed:
+                    failure_count = self._mark_session_health_locked(session.email, ok=False)
+                    remove = failure_count >= SELLER_SESSION_SOFT_FAILURE_THRESHOLD
+                    if remove:
+                        removed = self._remove_session_locked(
+                            session,
+                            acct_status="stale",
+                            reason=f"soft_request_failures:{method_name}",
+                        )
+                        if removed:
+                            self._schedule_recovery()
+                    else:
+                        removed = False
+                else:
+                    self._mark_session_health_locked(session.email, ok=True)
+                    removed = False
+                if not remove:
+                    self._release_session_locked(session)
+            if soft_failed and removed:
+                tried_emails.add(session.email)
+                log.warning(
+                    "seller pool removed soft-failing session: %s (%s)",
+                    session.email,
+                    method_name,
+                )
+                await session.close()
+                continue
+            return result
 
     async def health_snapshot(self) -> Dict[str, Any]:
         async with self._lock:
             self._sanitize_accounts_locked()
             await self._drop_dead_sessions_locked()
+            session_emails = [session.email for session in self._sessions]
             return {
-                "ready": self.active_session is not None,
+                "ready": bool(self._sessions),
+                "mode": "multi_master",
+                "session_count": len(self._sessions),
+                "session_emails": session_emails,
                 "active_email": self.active_session.email if self.active_session else None,
                 "standby_email": self.standby_session.email if self.standby_session else None,
                 "active_storage": str(self.active_session.storage_state_file) if self.active_session else None,
@@ -1346,65 +1411,144 @@ class SellerSessionManager:
             }
 
     async def _add_session(self, session: SellerSession):
+        to_close: Optional[SellerSession] = None
         async with self._lock:
             if self._stopped:
-                await session.close()
-                return
-            acct = self._account_locked(session.email)
-            if acct:
-                acct["status"] = "ready"
-                acct["last_state_ok_at"] = _iso_now()
-                acct["last_login_ok_at"] = acct.get("last_login_ok_at") or _iso_now()
-                acct["last_login_error"] = ""
-                acct["cooldown_until"] = None
-                acct["login_in_progress"] = False
-                acct["last_login_started_at"] = None
-            if self.active_session and self.active_session.email == session.email:
-                await self.active_session.close()
-                self.active_session = session
-                self._persist_accounts_locked()
-                return
-            if self.standby_session and self.standby_session.email == session.email:
-                await self.standby_session.close()
-                self.standby_session = session
-                self._persist_accounts_locked()
-                return
-            if self.active_session is None:
-                self.active_session = session
-                log.info("seller active session = %s", session.email)
-            elif self.standby_session is None:
-                self.standby_session = session
-                log.info("seller standby session = %s", session.email)
+                to_close = session
             else:
-                await session.close()
-            self._persist_accounts_locked()
+                acct = self._account_locked(session.email)
+                if acct:
+                    acct["status"] = "ready"
+                    acct["last_state_ok_at"] = _iso_now()
+                    acct["last_login_ok_at"] = acct.get("last_login_ok_at") or _iso_now()
+                    acct["last_login_error"] = ""
+                    acct["cooldown_until"] = None
+                    acct["login_in_progress"] = False
+                    acct["last_login_started_at"] = None
+
+                replace_index = next(
+                    (idx for idx, current in enumerate(self._sessions) if current.email == session.email),
+                    None,
+                )
+                if replace_index is not None:
+                    to_close = self._sessions[replace_index]
+                    self._sessions[replace_index] = session
+                    self._session_inflight.setdefault(session.email, 0)
+                    self._session_soft_failures.pop(session.email, None)
+                elif len(self._sessions) < self._target_session_count():
+                    self._sessions.append(session)
+                    self._session_inflight.setdefault(session.email, 0)
+                    self._session_soft_failures.pop(session.email, None)
+                    log.info("seller session ready = %s", session.email)
+                else:
+                    to_close = session
+                if self._sessions:
+                    self._rr_cursor %= len(self._sessions)
+                else:
+                    self._rr_cursor = 0
+                self._persist_accounts_locked()
+
+        if to_close:
+            await to_close.close()
+        if self._stopped:
+            return
 
     async def _has_session_email(self, email: str) -> bool:
         async with self._lock:
-            return any(
-                session and session.email == email
-                for session in (self.active_session, self.standby_session)
-            )
+            return any(session.email == email for session in self._sessions)
 
     async def _is_pool_full(self, target_count: int) -> bool:
         async with self._lock:
             return self._session_count_locked() >= target_count
 
     def _session_count_locked(self) -> int:
-        return int(self.active_session is not None) + int(self.standby_session is not None)
+        return len(self._sessions)
+
+    def _ordered_sessions_locked(self) -> list[SellerSession]:
+        if not self._sessions:
+            return []
+        start = self._rr_cursor % len(self._sessions)
+        return self._sessions[start:] + self._sessions[:start]
+
+    def _checkout_session_locked(self, exclude_emails: set[str]) -> Optional[SellerSession]:
+        ordered = self._ordered_sessions_locked()
+        candidates = [session for session in ordered if session.email not in exclude_emails]
+        if not candidates:
+            return None
+
+        best_index = 0
+        best_key = None
+        for idx, session in enumerate(candidates):
+            key = (self._session_inflight.get(session.email, 0), idx)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_index = idx
+        chosen = candidates[best_index]
+        self._session_inflight[chosen.email] = self._session_inflight.get(chosen.email, 0) + 1
+        if self._sessions:
+            chosen_index = self._sessions.index(chosen)
+            self._rr_cursor = (chosen_index + 1) % len(self._sessions)
+        return chosen
+
+    def _release_session_locked(self, session: SellerSession):
+        current = self._session_inflight.get(session.email, 0)
+        if current <= 1:
+            self._session_inflight.pop(session.email, None)
+        else:
+            self._session_inflight[session.email] = current - 1
+
+    def _mark_session_health_locked(self, email: str, ok: bool) -> int:
+        if ok:
+            self._session_soft_failures.pop(email, None)
+            return 0
+        failures = self._session_soft_failures.get(email, 0) + 1
+        self._session_soft_failures[email] = failures
+        return failures
+
+    @staticmethod
+    def _result_is_soft_failure(method_name: str, result: Any) -> bool:
+        if method_name == "fetch_variant_model_result":
+            return isinstance(result, dict) and result.get("status") == VARIANT_MODEL_STATUS_REQUEST_FAILED
+        if method_name == "fetch_data_v3":
+            return result is None
+        return False
+
+    def _remove_session_locked(self, session: SellerSession, acct_status: str, reason: str) -> bool:
+        remove_index = next(
+            (idx for idx, current in enumerate(self._sessions) if current is session),
+            None,
+        )
+        if remove_index is None:
+            return False
+        self._sessions.pop(remove_index)
+        self._session_inflight.pop(session.email, None)
+        self._session_soft_failures.pop(session.email, None)
+        acct = self._account_locked(session.email)
+        if acct:
+            acct["status"] = acct_status
+            acct["last_login_error"] = reason
+        self._last_failure = {
+            "email": session.email,
+            "reason": reason,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if self._sessions:
+            self._rr_cursor %= len(self._sessions)
+        else:
+            self._rr_cursor = 0
+        self._persist_accounts_locked()
+        return True
 
     async def _drop_dead_sessions_locked(self):
-        for role in ("active_session", "standby_session"):
-            session = getattr(self, role)
-            if not session:
+        dead_sessions = [session for session in list(self._sessions) if not session.is_shallow_ready()]
+        for session in dead_sessions:
+            removed = self._remove_session_locked(
+                session,
+                acct_status="stale",
+                reason="session_dead",
+            )
+            if not removed:
                 continue
-            if session.is_shallow_ready():
-                continue
-            setattr(self, role, None)
-            acct = self._account_locked(session.email)
-            if acct:
-                acct["status"] = "stale"
-                acct["last_login_error"] = "session_dead"
             self._last_failure = {
                 "email": session.email,
                 "reason": "shallow_check_failed",
@@ -1412,29 +1556,51 @@ class SellerSessionManager:
             }
             log.warning("seller session dead: %s", session.email)
             await session.close()
-        if self.active_session is None and self.standby_session is not None:
-            self.active_session = self.standby_session
-            self.standby_session = None
-            log.info("seller failover: standby promoted to active = %s", self.active_session.email)
-        self._persist_accounts_locked()
 
-    async def _retire_active_locked(self, reason: str):
-        failed = self.active_session
-        if not failed:
-            return
-        self.active_session = None
-        acct = self._account_locked(failed.email)
-        if acct:
-            acct["status"] = "failed"
-            acct["last_login_error"] = reason
-        self._last_failure = {
-            "email": failed.email,
-            "reason": reason,
-            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        log.warning("seller active session retired: %s (%s)", failed.email, reason)
-        await failed.close()
-        self._persist_accounts_locked()
+    async def _probe_sessions(self, sessions: list[SellerSession]) -> bool:
+        removed_any = False
+        for session in sessions:
+            if session._request_lock.locked():
+                continue
+            try:
+                async with session._request_lock:
+                    ok = await session.probe_api()
+            except Exception as e:
+                ok = False
+                log.warning("seller probe raised for %s: %s", session.email, e)
+
+            async with self._lock:
+                if ok:
+                    self._mark_session_health_locked(session.email, ok=True)
+                    continue
+                failure_count = self._mark_session_health_locked(session.email, ok=False)
+                if failure_count < SELLER_SESSION_SOFT_FAILURE_THRESHOLD:
+                    log.warning(
+                        "seller probe soft failure %d/%d: %s",
+                        failure_count,
+                        SELLER_SESSION_SOFT_FAILURE_THRESHOLD,
+                        session.email,
+                    )
+                    continue
+                removed = self._remove_session_locked(
+                    session,
+                    acct_status="stale",
+                    reason="probe_api_failed",
+                )
+                if removed:
+                    self._last_failure = {
+                        "email": session.email,
+                        "reason": "probe_api_failed",
+                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    self._schedule_recovery()
+                else:
+                    removed = False
+            if removed:
+                removed_any = True
+                log.warning("seller session probe failed: %s", session.email)
+                await session.close()
+        return removed_any
 
     def _account_locked(self, email: str) -> Optional[dict]:
         for acct in self._accounts:
