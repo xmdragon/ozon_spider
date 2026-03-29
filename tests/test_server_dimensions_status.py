@@ -19,6 +19,7 @@ async def test_get_sku_returns_product_with_no_data_status(monkeypatch):
             "sku": "1673537055",
             "status": "no_data",
             "dimensions": None,
+            "categories": [{"id": "1", "level": "1", "name": "demo"}],
             "error": None,
         }
 
@@ -31,6 +32,7 @@ async def test_get_sku_returns_product_with_no_data_status(monkeypatch):
         "sku": "1673537055",
         "name": "demo",
         "dimensions": None,
+        "seller_categories": [{"id": "1", "level": "1", "name": "demo"}],
         "seller_dimensions_status": "no_data",
         "seller_dimensions_detail": {
             "code": "seller_dimensions_not_found",
@@ -50,6 +52,7 @@ async def test_variant_model_returns_per_sku_status(monkeypatch):
                 "sku": sku,
                 "status": "ok",
                 "dimensions": {"weight": 100.0, "depth": 200.0, "width": 150.0, "height": 20.0},
+                "categories": [{"id": "1", "level": "1", "name": "cat-a"}],
                 "error": None,
             }
         if sku == "no-data-sku":
@@ -57,12 +60,14 @@ async def test_variant_model_returns_per_sku_status(monkeypatch):
                 "sku": sku,
                 "status": "no_data",
                 "dimensions": None,
+                "categories": [{"id": "2", "level": "2", "name": "cat-b"}],
                 "error": None,
             }
         return {
             "sku": sku,
             "status": "request_failed",
             "dimensions": None,
+            "categories": None,
             "error": "http_500",
         }
 
@@ -91,18 +96,21 @@ async def test_variant_model_returns_per_sku_status(monkeypatch):
                     "width": 150.0,
                     "height": 20.0,
                 },
+                "categories": [{"id": "1", "level": "1", "name": "cat-a"}],
                 "error": None,
             },
             "no-data-sku": {
                 "sku": "no-data-sku",
                 "status": "no_data",
                 "dimensions": None,
+                "categories": [{"id": "2", "level": "2", "name": "cat-b"}],
                 "error": None,
             },
             "failed-sku": {
                 "sku": "failed-sku",
                 "status": "request_failed",
                 "dimensions": None,
+                "categories": None,
                 "error": "http_500",
             },
         },

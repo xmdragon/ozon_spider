@@ -258,6 +258,7 @@ async def get_sku(sku: str = Query(..., description="Ozon SKU")):
     - ok: seller 查询成功，dimensions 已填充
     - no_data: seller 查询成功，但没有查到尺寸；仍返回 200，dimensions 为 null，
       并在 seller_dimensions_detail 中说明原因
+    - seller_categories: 透传 seller search-variant-model 原始 categories 列表
 
     异常语义:
     - seller session 不可用: 503 / seller_session_unavailable
@@ -282,12 +283,14 @@ async def get_sku(sku: str = Query(..., description="Ozon SKU")):
         })
     if variant_result.get("status") == "no_data":
         data["dimensions"] = None
+        data["seller_categories"] = variant_result.get("categories")
         data["seller_dimensions_status"] = "no_data"
         data["seller_dimensions_detail"] = _seller_dimensions_error_detail(sku, variant_result)
         return data
     if variant_result.get("status") != "ok":
         raise HTTPException(502, _seller_dimensions_error_detail(sku, variant_result))
     data["dimensions"] = _normalize_dimensions_for_sku(variant_result["dimensions"])
+    data["seller_categories"] = variant_result.get("categories")
     data["seller_dimensions_status"] = "ok"
     data["seller_dimensions_detail"] = None
 
@@ -305,7 +308,7 @@ async def variant_model(req: SkuListRequest):
 
     返回:
     - dimensions: 仅包含 status=ok 的 SKU 尺寸结果
-    - results[sku]: 每个 SKU 的 seller 查询状态
+    - results[sku]: 每个 SKU 的 seller 查询状态，包含 dimensions/categories/error
 
     results[sku].status 语义:
     - ok: seller 查询成功，且拿到了尺寸/重量

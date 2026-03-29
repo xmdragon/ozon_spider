@@ -79,12 +79,14 @@ def _variant_model_result(
     sku: str,
     status: str,
     dimensions: Optional[Dict[str, Any]] = None,
+    categories: Optional[list[Dict[str, Any]]] = None,
     error: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "sku": str(sku),
         "status": status,
         "dimensions": dimensions,
+        "categories": categories,
         "error": error,
     }
 
@@ -918,7 +920,7 @@ class SellerSession:
         请求 search-variant-model 获取单个 SKU 的尺寸/重量状态。
 
         返回:
-        - {"sku", "status", "dimensions", "error"}
+        - {"sku", "status", "dimensions", "categories", "error"}
 
         其中 status 含义为:
         - ok: seller 查询成功，且拿到了尺寸/重量
@@ -953,7 +955,9 @@ class SellerSession:
             if not items:
                 log.info("variant-model SKU %s returned 0 items", sku)
                 return _variant_model_result(sku, VARIANT_MODEL_STATUS_NO_DATA)
-            attrs = items[0].get("attributes", [])
+            item = items[0]
+            attrs = item.get("attributes", [])
+            categories = item.get("categories") or []
             dimensions = {}
             for attr in attrs:
                 key = str(attr.get("key", ""))
@@ -964,12 +968,17 @@ class SellerSession:
                         pass
             if not dimensions:
                 log.info("variant-model SKU %s returned item without dimensions", sku)
-                return _variant_model_result(sku, VARIANT_MODEL_STATUS_NO_DATA)
+                return _variant_model_result(
+                    sku,
+                    VARIANT_MODEL_STATUS_NO_DATA,
+                    categories=categories,
+                )
             log.info("SKU %s dimensions: %s", sku, dimensions)
             return _variant_model_result(
                 sku,
                 VARIANT_MODEL_STATUS_OK,
                 dimensions=dimensions,
+                categories=categories,
             )
         except SellerSessionUnavailable:
             raise
