@@ -9,6 +9,7 @@ import logging
 import time
 
 from playwright.async_api import async_playwright
+from browser_pages import ensure_single_page
 from extractor import (
     attach_page_observers,
     classify_page, extract_product, extract_variant_from_api,
@@ -57,18 +58,7 @@ async def setup_page(context):
     headers to all requests from the page, including cross-origin static
     assets, which breaks Ozon's CORS flow for ozonstatic resources.
     """
-    existing_pages = [p for p in context.pages if not p.is_closed()]
-    blank_pages = [p for p in existing_pages if p.url in ("", "about:blank")]
-
-    if blank_pages:
-        page = blank_pages[0]
-        for extra in blank_pages[1:]:
-            try:
-                await extra.close()
-            except Exception:
-                pass
-    else:
-        page = await context.new_page()
+    page = await ensure_single_page(context.pages, context.new_page)
     attach_page_observers(page)
     return page
 

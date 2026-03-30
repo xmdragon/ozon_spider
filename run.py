@@ -16,7 +16,7 @@ from config import (
     CHROME_BIN, CDP_PORT, BROWSER_DISPLAY, BROWSER_USE_XVFB, apply_browser_display_env,
     SUCCESS_THRESHOLD, OUTPUT_FILE,
 )
-from chrome_launcher import start_xvfb, start_chrome, kill
+from chrome_launcher import start_xvfb, start_chrome, kill, tiled_window_geometry
 from spider import run_spider
 
 logging.basicConfig(
@@ -96,7 +96,14 @@ async def main():
 
         # Start Chrome
         try:
-            chrome_proc = start_chrome(CHROME_BIN, CDP_PORT, BROWSER_DISPLAY)
+            window_size, window_position = tiled_window_geometry(0)
+            chrome_proc = start_chrome(
+                CHROME_BIN,
+                CDP_PORT,
+                BROWSER_DISPLAY,
+                window_size=window_size,
+                window_position=window_position,
+            )
         except RuntimeError as e:
             log.error(f"Chrome failed to start: {e}")
             wait = random.uniform(5, 10)

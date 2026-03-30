@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from chrome_launcher import kill, start_chrome
+from chrome_launcher import kill, start_chrome, tiled_window_geometry
 from spider import fetch_product, load_cookies, save_cookies, setup_page
 
 log = logging.getLogger(__name__)
@@ -33,6 +33,7 @@ class SpiderWorker:
         user_data_dir: Path | None = None,
         persistent: bool = False,
         cookies_path: Path | None = None,
+        window_slot: int = 0,
     ):
         self._playwright = playwright
         self._chrome_bin = chrome_bin
@@ -42,6 +43,7 @@ class SpiderWorker:
         self.user_data_dir = user_data_dir or Path(tempfile.mkdtemp(prefix="ozon_spider_profile_"))
         self.persistent = persistent
         self.cookies_path = cookies_path
+        self.window_slot = window_slot
         self.chrome_proc = None
         self.browser = None
         self.context = None
@@ -49,11 +51,14 @@ class SpiderWorker:
         self.last_used = time.time()
 
     async def start(self):
+        window_size, window_position = tiled_window_geometry(self.window_slot)
         self.chrome_proc = start_chrome(
             self._chrome_bin,
             self.cdp_port,
             self._display,
             user_data_dir=str(self.user_data_dir) if self.user_data_dir else None,
+            window_size=window_size,
+            window_position=window_position,
         )
         self.browser = await self._playwright.chromium.connect_over_cdp(
             f"http://127.0.0.1:{self.cdp_port}"
@@ -137,6 +142,7 @@ class SpiderWorkerPool:
         self._cond = asyncio.Condition()
         self._reaper_task: asyncio.Task | None = None
         self._fill_task: asyncio.Task | None = None
+        self._spawn_seq = 0
         SPIDER_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
         self._persistent_profile_dir = self._load_persistent_profile_dir()
 
@@ -382,6 +388,8 @@ class SpiderWorkerPool:
             worker.user_data_dir == self._persistent_profile_dir for worker in self._workers
         )
         profile_dir = self._persistent_profile_dir if use_persistent else None
+        window_slot = 2 * (self._spawn_seq % 2)
+        self._spawn_seq += 1
         return SpiderWorker(
             self._playwright,
             self._chrome_bin,
@@ -389,6 +397,7 @@ class SpiderWorkerPool:
             user_data_dir=profile_dir,
             persistent=use_persistent,
             cookies_path=SPIDER_COOKIES_PATH,
+            window_slot=window_slot,
         )
 
     @staticmethod

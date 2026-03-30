@@ -78,6 +78,24 @@ class PoolFakeSession:
         return bool(item)
 
 
+class FailedLoginSession:
+    def __init__(self, reason: str):
+        self.login_failure_reason = reason
+        self.cooldown_until = None
+        self.closed = False
+        self.purged = []
+        self.hold_calls = []
+
+    async def close(self):
+        self.closed = True
+
+    def purge_session_artifacts(self, reason: str):
+        self.purged.append(reason)
+
+    async def hold_before_close(self, reason: str, seconds: int = 30):
+        self.hold_calls.append((reason, seconds))
+
+
 @pytest.mark.asyncio
 async def test_existing_authenticated_flow_clicks_login_button_from_signin():
     session = SellerSession(
@@ -218,3 +236,85 @@ async def test_manager_soft_request_failures_require_two_hits_before_removal():
     assert third["status"] == "ok"
     assert flaky.closed is True
     assert [session.email for session in manager._sessions] == ["b@example.com"]
+
+
+@pytest.mark.asyncio
+async def test_attempt_login_purges_and_retries_after_antibot_timeout():
+    manager = SellerSessionManager([
+        {"email": "a@example.com", "app_password": "x", "client_id": "1"},
+    ])
+    manager._persist_accounts_locked = lambda: None
+    acct = {
+        "email": "a@example.com",
+        "app_password": "x",
+        "client_id": "1",
+        "state_file": "seller_state_a.json",
+        "profile_dir": "seller_profile_a",
+        "cdp_port": 9224,
+        "status": "unknown",
+        "last_login_error": "",
+        "cooldown_until": None,
+        "login_in_progress": False,
+        "last_login_started_at": None,
+    }
+    failed = FailedLoginSession("signin_not_ready_timeout")
+    success = PoolFakeSession("a@example.com", [])
+    calls = []
+
+    async def fake_open_session(_acct, allow_login: bool):
+        calls.append(allow_login)
+        if len(calls) == 1:
+            return None, failed
+        return success, None
+
+    manager._open_session = fake_open_session
+
+    result = await manager._attempt_login(acct)
+
+    assert result is success
+    assert calls == [True, True]
+    assert failed.closed is True
+    assert failed.purged == ["signin_not_ready_timeout"]
+    assert failed.hold_calls == []
+
+
+@pytest.mark.asyncio
+async def test_attempt_login_purges_after_final_antibot_timeout():
+    manager = SellerSessionManager([
+        {"email": "a@example.com", "app_password": "x", "client_id": "1"},
+    ])
+    manager._persist_accounts_locked = lambda: None
+    acct = {
+        "email": "a@example.com",
+        "app_password": "x",
+        "client_id": "1",
+        "state_file": "seller_state_a.json",
+        "profile_dir": "seller_profile_a",
+        "cdp_port": 9224,
+        "status": "unknown",
+        "last_login_error": "",
+        "cooldown_until": None,
+        "login_in_progress": False,
+        "last_login_started_at": None,
+    }
+    failed_first = FailedLoginSession("signin_not_ready_timeout")
+    failed_second = FailedLoginSession("post_signin_not_ready_timeout")
+    calls = []
+
+    async def fake_open_session(_acct, allow_login: bool):
+        calls.append(allow_login)
+        if len(calls) == 1:
+            return None, failed_first
+        return None, failed_second
+
+    manager._open_session = fake_open_session
+
+    result = await manager._attempt_login(acct)
+
+    assert result is None
+    assert calls == [True, True]
+    assert failed_first.closed is True
+    assert failed_first.purged == ["signin_not_ready_timeout"]
+    assert failed_second.closed is True
+    assert failed_second.purged == ["post_signin_not_ready_timeout"]
+    assert failed_second.hold_calls == [("post_signin_not_ready_timeout", 30)]

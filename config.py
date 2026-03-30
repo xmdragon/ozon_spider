@@ -13,6 +13,16 @@ ACCOUNT_JSON_PATH = Path(__file__).parent / "account.json"
 
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/google-chrome-stable")
 CDP_PORT = int(os.getenv("CDP_PORT", "9223"))
+DISPLAY_SCREENSHOT_DEBUG = str(os.getenv("DISPLAY_SCREENSHOT_DEBUG", "")).strip().lower() in {
+    "1", "true", "yes", "on",
+}
+DISPLAY_SCREENSHOT_INTERVAL_SECONDS = max(
+    1,
+    int(os.getenv("DISPLAY_SCREENSHOT_INTERVAL_SECONDS", "5")),
+)
+DISPLAY_SCREENSHOT_DIR = Path(
+    os.getenv("DISPLAY_SCREENSHOT_DIR", str(Path(__file__).parent / "screenshot"))
+).expanduser()
 
 
 def _normalize_display_name(value: str) -> str:

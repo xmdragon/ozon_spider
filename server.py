@@ -15,6 +15,7 @@ import asyncio
 import logging
 import random
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, Query, HTTPException
@@ -22,9 +23,11 @@ from pydantic import BaseModel
 
 from config import (
     CHROME_BIN, CDP_PORT, BROWSER_DISPLAY, BROWSER_USE_XVFB, apply_browser_display_env,
-    SELLER_ACCOUNTS,
+    SELLER_ACCOUNTS, DISPLAY_SCREENSHOT_DEBUG, DISPLAY_SCREENSHOT_INTERVAL_SECONDS,
+    DISPLAY_SCREENSHOT_DIR,
 )
 from chrome_launcher import kill, start_xvfb
+from display_screenshot import run_display_screenshot_loop
 from spider_pool import SpiderWorkerPool
 from seller_login import SellerSessionManager, SellerSessionUnavailable
 from playwright.async_api import async_playwright
@@ -44,6 +47,7 @@ class AppState:
     seller_manager: Optional[SellerSessionManager] = None
     spider_playwright = None
     spider_pool: Optional[SpiderWorkerPool] = None
+    display_screenshot_task: Optional[asyncio.Task] = None
 
 state = AppState()
 
@@ -152,9 +156,32 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_init_seller())
 
+    if DISPLAY_SCREENSHOT_DEBUG:
+        screenshot_dir = Path(DISPLAY_SCREENSHOT_DIR)
+        state.display_screenshot_task = asyncio.create_task(
+            run_display_screenshot_loop(
+                screenshot_dir,
+                BROWSER_DISPLAY,
+                DISPLAY_SCREENSHOT_INTERVAL_SECONDS,
+            )
+        )
+        log.info(
+            "Display screenshot debug enabled: display=%s interval=%ss dir=%s",
+            BROWSER_DISPLAY,
+            DISPLAY_SCREENSHOT_INTERVAL_SECONDS,
+            screenshot_dir,
+        )
+
     yield
 
     # 关闭
+    if state.display_screenshot_task and not state.display_screenshot_task.done():
+        state.display_screenshot_task.cancel()
+        try:
+            await state.display_screenshot_task
+        except asyncio.CancelledError:
+            pass
+    state.display_screenshot_task = None
     if state.seller_manager:
         await state.seller_manager.close()
     if state.spider_pool:

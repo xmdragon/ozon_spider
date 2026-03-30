@@ -7,6 +7,7 @@ import os
 import signal
 import requests
 import logging
+from typing import Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -30,11 +31,25 @@ def _make_user_data_dir() -> str:
     return d
 
 
+def tiled_window_geometry(slot: int) -> tuple[tuple[int, int], tuple[int, int]]:
+    width, height = 940, 500
+    positions = (
+        (0, 0),
+        (960, 0),
+        (0, 540),
+        (960, 540),
+    )
+    x, y = positions[slot % len(positions)]
+    return (width, height), (x, y)
+
+
 def start_chrome(
     chrome_bin: str,
     cdp_port: int,
     display: str = None,
     user_data_dir: str = None,
+    window_size: Optional[Tuple[int, int]] = None,
+    window_position: Optional[Tuple[int, int]] = None,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     if display:
@@ -64,9 +79,12 @@ def start_chrome(
         "--use-mock-keychain",
         "--lang=ru-RU",
         "--accept-lang=ru-RU,ru;q=0.9",
-        "--window-size=1920,1080",
         "about:blank",
     ]
+    if window_size is not None:
+        cmd.insert(-1, f"--window-size={window_size[0]},{window_size[1]}")
+    if window_position is not None:
+        cmd.insert(-1, f"--window-position={window_position[0]},{window_position[1]}")
     if user_data_dir is not None:
         cmd.insert(2, f"--user-data-dir={user_data_dir}")
     proc = subprocess.Popen(

@@ -16,14 +16,16 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from chrome_launcher import start_chrome, kill
+from browser_pages import ensure_single_page
 from config import ACCOUNT_JSON_PATH, CHROME_BIN, BROWSER_DISPLAY, apply_browser_display_env
+from chrome_launcher import tiled_window_geometry
 
 log = logging.getLogger(__name__)
 
 SELLER_CDP_PORT = 9224
 SELLER_DASHBOARD = "https://seller.ozon.ru/app/dashboard"
 SELLER_LOGIN_URL = "https://seller.ozon.ru/"
-SELLER_LOGIN_READY_TIMEOUT = 60
+SELLER_LOGIN_READY_TIMEOUT = 30
 SELLER_LOGIN_POLL_INTERVAL = 0.25
 SELLER_LOGIN_CHALLENGE_POLL_INTERVAL = 0.5
 SELLER_LOGIN_LOADSTATE_TIMEOUT_MS = 500
@@ -39,6 +41,12 @@ SELLER_ACCOUNT_RECOVERY_INTERVAL_SECONDS = 300
 SELLER_ACCOUNT_RETRY_COOLDOWN_SECONDS = 300
 SELLER_LOGIN_PROGRESS_STALE_SECONDS = 900
 SELLER_SESSION_SOFT_FAILURE_THRESHOLD = 2
+SELLER_CLEAN_RELOGIN_FAILURE_REASONS = {
+    "signin_not_ready_timeout",
+    "post_signin_not_ready_timeout",
+    "email_entry_not_ready_timeout",
+    "post_email_mode_not_ready_timeout",
+}
 # seller 尺寸查询状态：
 # - ok: seller 查询成功，且解析到尺寸/重量
 # - no_data: seller 查询成功，但没有命中记录或记录里没有尺寸字段
@@ -100,6 +108,10 @@ def _ensure_retry_cooldown(
     if explicit_until and explicit_until > minimum_until:
         return explicit_until
     return minimum_until
+
+
+def _should_purge_and_retry_login_failure(reason: Optional[str]) -> bool:
+    return bool(reason and reason in SELLER_CLEAN_RELOGIN_FAILURE_REASONS)
 
 
 class SellerSessionUnavailable(RuntimeError):
@@ -566,8 +578,12 @@ class SellerSession:
         apply_browser_display_env()
         seller_profile = self.profile_dir
         seller_profile.mkdir(exist_ok=True)
+        seller_index = max(0, self.cdp_port - SELLER_CDP_PORT)
+        window_size, window_position = tiled_window_geometry(1 + 2 * (seller_index % 2))
         self._chrome_proc = start_chrome(CHROME_BIN, self.cdp_port, BROWSER_DISPLAY,
-                                         user_data_dir=str(seller_profile.absolute()))
+                                         user_data_dir=str(seller_profile.absolute()),
+                                         window_size=window_size,
+                                         window_position=window_position)
 
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.connect_over_cdp(
@@ -575,17 +591,7 @@ class SellerSession:
         )
         self._context = self._browser.contexts[0] if self._browser.contexts else \
             await self._browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow")
-        pages = [p for p in self._context.pages if not p.is_closed()]
-        blank_pages = [p for p in pages if p.url in ("", "about:blank")]
-        if blank_pages:
-            self._page = blank_pages[0]
-            for extra in blank_pages[1:]:
-                try:
-                    await extra.close()
-                except Exception:
-                    pass
-        else:
-            self._page = await self._context.new_page()
+        self._page = await ensure_single_page(self._context.pages, self._context.new_page)
 
         # 尝试恢复已有 session
         if self.storage_state_file.exists():
@@ -658,7 +664,7 @@ class SellerSession:
                 await asyncio.sleep(3)
 
             log.info("登录页 URL: %s", self._page.url)
-            ready_state = await self._wait_for_login_ready("进入登录页后", timeout=60)
+            ready_state = await self._wait_for_login_ready("进入登录页后", timeout=SELLER_LOGIN_READY_TIMEOUT)
             log.info("登录页就绪状态: %s | URL: %s", ready_state, self._page.url)
             if ready_state == "authenticated":
                 return True
@@ -669,7 +675,7 @@ class SellerSession:
 
             # 步骤1: 点击「登录」按钮
             if await self._click_login_button():
-                post_click_state = await self._wait_for_login_ready("点击登录后", timeout=60)
+                post_click_state = await self._wait_for_login_ready("点击登录后", timeout=SELLER_LOGIN_READY_TIMEOUT)
                 log.info("点击登录后状态: %s | URL: %s", post_click_state, self._page.url)
                 if post_click_state == "authenticated":
                     return True
@@ -682,7 +688,7 @@ class SellerSession:
             if await self._handle_existing_authenticated_flow():
                 log.info("检测到已认证流程，无需重新收验证码")
             else:
-                pre_sso_state = await self._wait_for_login_ready("进入邮箱登录前", timeout=60)
+                pre_sso_state = await self._wait_for_login_ready("进入邮箱登录前", timeout=SELLER_LOGIN_READY_TIMEOUT)
                 log.info("邮箱登录前状态: %s | URL: %s", pre_sso_state, self._page.url)
                 if pre_sso_state == "authenticated":
                     return True
@@ -717,7 +723,7 @@ class SellerSession:
                         break
                     await asyncio.sleep(SELLER_LOGIN_POLL_INTERVAL)
 
-                post_email_mode_state = await self._wait_for_login_ready("点击邮箱登录后", timeout=60)
+                post_email_mode_state = await self._wait_for_login_ready("点击邮箱登录后", timeout=SELLER_LOGIN_READY_TIMEOUT)
                 log.info("点击邮箱登录后状态: %s | URL: %s", post_email_mode_state, self._page.url)
                 if post_email_mode_state == "authenticated":
                     return True
@@ -1668,7 +1674,26 @@ class SellerSessionManager:
             self._persist_accounts_locked()
 
         log.info("后台静默登录 seller 账号: %s", acct["email"])
-        session, failed = await self._open_session(acct, allow_login=True)
+        failed = None
+        clean_relogin_attempted = False
+        while True:
+            session, failed = await self._open_session(acct, allow_login=True)
+            if session:
+                break
+            failure_reason = failed.login_failure_reason if failed and failed.login_failure_reason else "login_failed"
+            if not failed or clean_relogin_attempted or not _should_purge_and_retry_login_failure(failure_reason):
+                break
+
+            clean_relogin_attempted = True
+            log.warning(
+                "seller 登录卡在 anti-bot 终页，清理状态并重试: email=%s reason=%s",
+                acct["email"],
+                failure_reason,
+            )
+            await failed.close()
+            failed.purge_session_artifacts(failure_reason)
+            failed = None
+
         if session:
             async with self._lock:
                 acct["status"] = "ready"
@@ -1696,4 +1721,6 @@ class SellerSessionManager:
         if failed:
             await failed.hold_before_close(failure_reason)
             await failed.close()
+            if _should_purge_and_retry_login_failure(failure_reason):
+                failed.purge_session_artifacts(failure_reason)
         return None
