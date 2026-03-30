@@ -10,6 +10,8 @@ if _env.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 ACCOUNT_JSON_PATH = Path(__file__).parent / "account.json"
+PROJECT_ROOT = Path(__file__).parent
+TMP_ROOT = Path(os.getenv("APP_TMP_DIR", str(PROJECT_ROOT / "tmp"))).expanduser()
 
 CHROME_BIN = os.getenv("CHROME_BIN", "/usr/bin/google-chrome-stable")
 CDP_PORT = int(os.getenv("CDP_PORT", "9223"))
@@ -21,7 +23,7 @@ DISPLAY_SCREENSHOT_INTERVAL_SECONDS = max(
     int(os.getenv("DISPLAY_SCREENSHOT_INTERVAL_SECONDS", "5")),
 )
 DISPLAY_SCREENSHOT_DIR = Path(
-    os.getenv("DISPLAY_SCREENSHOT_DIR", str(Path(__file__).parent / "screenshot"))
+    os.getenv("DISPLAY_SCREENSHOT_DIR", str(PROJECT_ROOT / "screenshot"))
 ).expanduser()
 
 

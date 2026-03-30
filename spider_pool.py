@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Any
 
 from chrome_launcher import kill, start_chrome, tiled_window_geometry
+from config import TMP_ROOT
 from spider import fetch_product, load_cookies, save_cookies, setup_page
 
 log = logging.getLogger(__name__)
 
-SPIDER_RUNTIME_ROOT = Path("/tmp/ozon_spider_runtime")
+SPIDER_RUNTIME_ROOT = TMP_ROOT / "ozon_spider_runtime"
 SPIDER_STATE_PATH = SPIDER_RUNTIME_ROOT / "profile_state.json"
 SPIDER_COOKIES_PATH = SPIDER_RUNTIME_ROOT / "cookies.json"
 
@@ -40,7 +41,10 @@ class SpiderWorker:
         self._display = display
 
         self.cdp_port = _pick_free_port()
-        self.user_data_dir = user_data_dir or Path(tempfile.mkdtemp(prefix="ozon_spider_profile_"))
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.user_data_dir = user_data_dir or Path(
+            tempfile.mkdtemp(prefix="ozon_spider_profile_", dir=str(TMP_ROOT))
+        )
         self.persistent = persistent
         self.cookies_path = cookies_path
         self.window_slot = window_slot
@@ -143,6 +147,7 @@ class SpiderWorkerPool:
         self._reaper_task: asyncio.Task | None = None
         self._fill_task: asyncio.Task | None = None
         self._spawn_seq = 0
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
         SPIDER_RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
         self._persistent_profile_dir = self._load_persistent_profile_dir()
 

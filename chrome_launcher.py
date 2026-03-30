@@ -8,6 +8,7 @@ import signal
 import requests
 import logging
 from typing import Optional, Tuple
+from config import TMP_ROOT
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +27,8 @@ def start_xvfb(display: str = ":99", resolution: str = "1920x1080x24") -> subpro
 def _make_user_data_dir() -> str:
     """Create a fresh temp user-data-dir per Chrome session."""
     import tempfile
-    d = tempfile.mkdtemp(prefix="ozon_chrome_")
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    d = tempfile.mkdtemp(prefix="ozon_chrome_", dir=str(TMP_ROOT))
     log.info(f"user-data-dir: {d}")
     return d
 

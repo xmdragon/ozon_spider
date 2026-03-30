@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from config import TMP_ROOT
 from seller_login import SellerSession, SellerSessionManager, SellerSessionUnavailable
 
 
@@ -59,7 +60,8 @@ class PoolFakeSession:
         self._responses = list(responses)
         self._probe_results = list(probe_results or [])
         self._request_lock = asyncio.Lock()
-        self.storage_state_file = Path(f"/tmp/{email}.json")
+        TMP_ROOT.mkdir(parents=True, exist_ok=True)
+        self.storage_state_file = TMP_ROOT / f"{email}.json"
         self.closed = False
         self.shallow_ready = True
 

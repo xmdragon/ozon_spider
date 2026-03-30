@@ -12,6 +12,7 @@ results.json
 product.html
 *.log
 screenshot/
+tmp/
 adult_after_fill_blank.json
 adult_after_fill_blank.png
 observe_*.json
