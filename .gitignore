@@ -11,6 +11,7 @@ cookies.json
 results.json
 product.html
 *.log
+screenshot/
 adult_after_fill_blank.json
 adult_after_fill_blank.png
 observe_*.json

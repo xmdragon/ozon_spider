@@ -155,6 +155,40 @@ class SellerSession:
             and not any(k in url for k in ("signin", "ozonid", "sso", "registration"))
         )
 
+    async def _ensure_single_seller_page(self):
+        if not self._context:
+            return
+        pages = []
+        for page in self._context.pages:
+            try:
+                if page.is_closed():
+                    continue
+            except Exception:
+                continue
+            pages.append(page)
+        if not pages:
+            self._page = await self._context.new_page()
+            return
+
+        authenticated = [p for p in pages if self._is_authenticated_seller_url(getattr(p, "url", "") or "")]
+        non_blank = [p for p in pages if (getattr(p, "url", "") or "") not in ("", "about:blank")]
+
+        if authenticated:
+            primary = authenticated[-1]
+        elif non_blank:
+            primary = non_blank[-1]
+        else:
+            primary = pages[0]
+
+        for extra in pages:
+            if extra is primary:
+                continue
+            try:
+                await extra.close()
+            except Exception:
+                pass
+        self._page = primary
+
     async def _read_page_text(self) -> str:
         try:
             body = await self._page.text_content("body") or ""
@@ -248,6 +282,7 @@ class SellerSession:
         deadline = time.time() + timeout
         saw_challenge = False
         while time.time() < deadline:
+            await self._ensure_single_seller_page()
             url = self._page.url
             if self._is_authenticated_seller_url(url):
                 return "authenticated"
@@ -528,6 +563,7 @@ class SellerSession:
         saw_2fa = False
         deadline = time.time() + timeout
         while time.time() < deadline:
+            await self._ensure_single_seller_page()
             url = self._page.url
             if self._is_authenticated_seller_url(url):
                 return True
@@ -592,6 +628,7 @@ class SellerSession:
         self._context = self._browser.contexts[0] if self._browser.contexts else \
             await self._browser.new_context(locale="ru-RU", timezone_id="Europe/Moscow")
         self._page = await ensure_single_page(self._context.pages, self._context.new_page)
+        await self._ensure_single_seller_page()
 
         # 尝试恢复已有 session
         if self.storage_state_file.exists():

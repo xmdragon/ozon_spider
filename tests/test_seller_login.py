@@ -39,6 +39,20 @@ class RestoreFakePage:
         return None
 
 
+class SellerTabPage:
+    def __init__(self, url: str):
+        self.url = url
+        self.closed = False
+        self.close_calls = 0
+
+    def is_closed(self):
+        return self.closed
+
+    async def close(self):
+        self.closed = True
+        self.close_calls += 1
+
+
 class PoolFakeSession:
     def __init__(self, email: str, responses, probe_results=None):
         self.email = email
@@ -135,6 +149,25 @@ async def test_restore_session_keeps_existing_flow_after_dashboard_timeout(tmp_p
     session._context.add_cookies.assert_awaited_once()
     session._wait_for_login_ready.assert_awaited_once()
     session._handle_existing_authenticated_flow.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ensure_single_seller_page_keeps_latest_authenticated_or_non_blank():
+    session = SellerSession(
+        email="seller@example.com",
+        app_password="secret",
+        client_id="123",
+    )
+    old_signin = SellerTabPage("https://seller.ozon.ru/app/registration/signin?locale=zh-Hans")
+    new_signin = SellerTabPage("https://seller.ozon.ru/app/registration/signin?locale=zh-Hans&__rr=1")
+    session._context = type("Ctx", (), {"pages": [old_signin, new_signin], "new_page": AsyncMock()})()
+    session._page = old_signin
+
+    await session._ensure_single_seller_page()
+
+    assert session._page is new_signin
+    assert old_signin.close_calls == 1
+    assert new_signin.close_calls == 0
 
 
 @pytest.mark.asyncio
